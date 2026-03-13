@@ -1,0 +1,12 @@
+{
+  "name": "brain-memory",
+  "version": "0.1.0",
+  "description": "Brain-inspired memory plugin for OpenClaw — hippocampal buffer, working memory, and sleep consolidation via Neo4j graph",
+  "type": "module",
+  "dependencies": {},
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
