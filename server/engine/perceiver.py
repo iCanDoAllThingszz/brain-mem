@@ -14,22 +14,38 @@ from server.engine.llm_client import call_llm_json
 logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = """\
-You are a message classifier for a memory system. Your job is to quickly categorize \
-incoming messages into one of three types.
+You are a message classifier for a personal memory system. Your job is to quickly \
+categorize incoming messages to decide if they contain information worth remembering \
+about THIS SPECIFIC USER.
 
-Classification rules (recall-first — when in doubt, prefer "informative"):
-- "noise": Pure social filler with zero information content.
-  Examples: "嗯嗯", "好的", "哈哈", "OK", "收到", "😄", "哦"
-- "command": A pure instruction or request that asks the agent to DO something.
+Classification rules:
+
+- "noise": Zero information content, OR contains only universal common knowledge \
+  that everyone knows (e.g., "地球是圆的", "天是蓝的", "水是H2O", "今天天气不错").
+  Also includes pure social filler: "嗯嗯", "好的", "哈哈", "OK", "收到", "😄"
+
+- "command": A pure instruction or request that asks the agent to DO something, \
+  with no personal information embedded.
   Examples: "帮我搜一下X", "查一下天气", "翻译这段话", "设个提醒"
-- "informative": Contains new facts, relationships, decisions, plans, opinions, or \
-emotional expressions that are worth remembering.
+
+- "informative": Contains NEW information specific to this user that is worth \
+  remembering — personal facts, relationships, decisions, plans, opinions, \
+  emotional expressions, or user-specific knowledge.
   Examples: "我今天去字节面试了", "我决定辞职", "我最近压力很大", "公司要裁员了"
 
-If a message is BOTH a command AND informative (e.g., "帮我查一下，我明天要去北京出差"), \
-classify as "informative".
+Key distinction: "informative" means information that is UNIQUE to this user's life, \
+not general knowledge that anyone could look up.
 
-Return ONLY valid JSON in this exact format:
+If a message mixes common knowledge with personal info \
+(e.g., "地球是圆的，对了我打算学Rust"), classify as "informative" — \
+the personal part matters even if the rest is noise.
+
+If a message is BOTH a command AND informative \
+(e.g., "帮我查一下，我明天要去北京出差"), classify as "informative".
+
+When in doubt, prefer "informative" (recall-first principle).
+
+Return ONLY valid JSON:
 {
   "type": "noise" | "command" | "informative",
   "reason": "one-sentence explanation"
