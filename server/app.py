@@ -222,15 +222,20 @@ async def _process_after_response(
         wm = wm_store.get(session_id)
         perception = await perceiver.classify(user_message, wm)
         msg_type = perception.get("type")
-        logger.info("after-response perceiver type=%s session=%s", msg_type, session_id)
+        rewrite = perception.get("rewrite")
+        logger.info("after-response perceiver type=%s rewrite=%s session=%s",
+                     msg_type, bool(rewrite), session_id)
 
         log_event("perceiver", f"[{msg_type}] {user_message[:60]}", {
             "type": msg_type,
             "reason": perception.get("reason", ""),
+            "rewrite": rewrite[:100] if rewrite else None,
         })
 
         if msg_type == "informative":
-            evaluation = await evaluator.evaluate(user_message, wm)
+            # Use rewrite for evaluation and encoding if available
+            memory_input = rewrite or user_message
+            evaluation = await evaluator.evaluate(memory_input, wm)
 
             log_event("evaluator", f"relevance={evaluation.get('task_relevance')} emotion={evaluation.get('emotional_intensity')} novelty={evaluation.get('novelty')}", {
                 "encode_decision": evaluation.get("encode_decision"),
@@ -239,8 +244,9 @@ async def _process_after_response(
             })
 
             if evaluation.get("encode_decision"):
+                # Encode the rewrite (higher density) but store original message too
                 result = await encoder.encode_message(
-                    user_message, evaluation, tenant_id, user_id, session_id, wm
+                    memory_input, evaluation, tenant_id, user_id, session_id, wm
                 )
                 if result.get("skipped"):
                     log_event("encoder", f"Skipped: {result.get('reason')} | {user_message[:40]}", {
