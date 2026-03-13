@@ -1,0 +1,46 @@
+{
+  "id": "brain-memory",
+  "kind": "context-engine",
+  "uiHints": {
+    "serverUrl": {
+      "label": "Brain Memory Server URL",
+      "placeholder": "http://localhost:8100",
+      "help": "URL of the brain-memory FastAPI server"
+    },
+    "tenantId": {
+      "label": "Tenant ID",
+      "placeholder": "default",
+      "help": "Multi-tenant isolation identifier"
+    },
+    "userId": {
+      "label": "User ID",
+      "placeholder": "yugo",
+      "help": "User identifier for memory isolation"
+    },
+    "autoStart": {
+      "label": "Auto-Start Server",
+      "help": "Automatically start the brain-memory FastAPI server on plugin load"
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "serverUrl": {
+        "type": "string"
+      },
+      "tenantId": {
+        "type": "string"
+      },
+      "userId": {
+        "type": "string"
+      },
+      "autoStart": {
+        "type": "boolean"
+      },
+      "serverPath": {
+        "type": "string"
+      }
+    }
+  }
+}
