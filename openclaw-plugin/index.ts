@@ -232,6 +232,28 @@ const brainMemoryPlugin = {
     );
 
     // ========================================================================
+    // Session filtering — only process real user conversations
+    // ========================================================================
+
+    function isUserSession(sessionKey: string, prompt?: string): boolean {
+      // Skip cron jobs
+      if (sessionKey.includes(":cron:")) return false;
+      // Skip sub-agents
+      if (sessionKey.includes(":subagent:")) return false;
+      // Skip heartbeat prompts
+      if (prompt && (
+        prompt.includes("HEARTBEAT") ||
+        prompt.includes("Read HEARTBEAT.md") ||
+        prompt.includes("Pre-compaction memory flush")
+      )) return false;
+      // Skip cron task content in prompt
+      if (prompt && prompt.includes("[cron:")) return false;
+      // Skip inter-session messages
+      if (prompt && prompt.includes("[Inter-session message]")) return false;
+      return true;
+    }
+
+    // ========================================================================
     // Lifecycle Hooks
     // ========================================================================
 
@@ -240,6 +262,10 @@ const brainMemoryPlugin = {
       if (!event.prompt || event.prompt.length < 5) return;
 
       const sessionKey = ctx.sessionKey || "default";
+
+      // Only process real user conversations
+      if (!isUserSession(sessionKey, event.prompt)) return;
+
       const sessionId = getOrCreateSessionId(sessionKey);
 
       // Extract clean user query from prompt (strip metadata wrappers)
@@ -301,11 +327,18 @@ const brainMemoryPlugin = {
       if (!event.success || !event.messages || event.messages.length === 0) return;
 
       const sessionKey = ctx.sessionKey || "default";
+
+      // Only process real user conversations
+      if (!isUserSession(sessionKey)) return;
+
       const sessionId = getOrCreateSessionId(sessionKey);
 
       try {
-        // Extract user messages
-        for (const msg of event.messages) {
+        // Only process the LAST user message (not all historical messages)
+        // event.messages contains the full conversation history
+        let lastUserText = "";
+        for (let i = event.messages.length - 1; i >= 0; i--) {
+          const msg = event.messages[i];
           if (!msg || typeof msg !== "object") continue;
           const msgObj = msg as Record<string, unknown>;
           if (msgObj.role !== "user") continue;
@@ -321,52 +354,57 @@ const brainMemoryPlugin = {
             }
           }
           text = text.trim();
-          if (text.length < 10 || text.length > 2000) continue;
-
-          // Skip pure system-generated / internal content (no user text inside)
-          if (text.includes("<working-memory>") || text.includes("<retrieved-memories>")) continue;
-          if (text.includes("<<<BEGIN_UNTRUSTED_CHILD_RESULT>>>")) continue;
-          if (text.includes("[Internal task completion event]")) continue;
-          if (text.includes("OpenClaw runtime context (internal)")) continue;
-          if (text.includes("subagent_announce")) continue;
-          if (text.includes("HEARTBEAT_OK") || text.includes("Read HEARTBEAT.md")) continue;
-          if (/^\[Inter-session message\]/.test(text)) continue;
-          if (/^System:/.test(text)) continue;
-          if (/\[cron:/.test(text)) continue;
-
-          // Extract actual user text from messages with metadata prefix
-          // OpenClaw wraps user messages with "Conversation info..." + "Sender..." + actual text
-          if (text.includes("message_id") && text.includes("sender_id")) {
-            // Find the last block after all metadata — that's the real user message
-            const parts = text.split(/\n\n/);
-            let extracted = "";
-            for (let j = parts.length - 1; j >= 0; j--) {
-              const part = parts[j].trim();
-              // Skip JSON blocks, metadata headers, empty
-              if (!part) continue;
-              if (part.startsWith("{") || part.startsWith("```")) continue;
-              if (part.startsWith("Conversation info") || part.startsWith("Sender (")) continue;
-              extracted = part;
-              break;
-            }
-            if (extracted && extracted.length >= 5) {
-              text = extracted;
-            } else {
-              continue; // No meaningful user text found
-            }
+          if (text.length >= 10) {
+            lastUserText = text;
+            break;
           }
-
-          // Fire-and-forget: let the server's perceiver/evaluator/encoder pipeline decide
-          postJSON(`${cfg.serverUrl}/hooks/after-response`, {
-            tenant_id: cfg.tenantId,
-            user_id: cfg.userId,
-            session_id: sessionId,
-            user_message: text,
-            assistant_response: "",
-          }).catch((err) => {
-            api.logger.warn(`brain-memory: after-response failed: ${String(err)}`);
-          });
         }
+
+        if (!lastUserText || lastUserText.length < 10 || lastUserText.length > 2000) return;
+
+        let text = lastUserText;
+
+        // Skip pure system-generated / internal content
+        if (text.includes("<working-memory>") || text.includes("<retrieved-memories>")) return;
+        if (text.includes("<<<BEGIN_UNTRUSTED_CHILD_RESULT>>>")) return;
+        if (text.includes("[Internal task completion event]")) return;
+        if (text.includes("OpenClaw runtime context (internal)")) return;
+        if (text.includes("subagent_announce")) return;
+        if (text.includes("HEARTBEAT_OK") || text.includes("Read HEARTBEAT.md")) return;
+        if (/^\[Inter-session message\]/.test(text)) return;
+        if (/^System:/.test(text)) return;
+        if (/\[cron:/.test(text)) return;
+        if (text.includes("Pre-compaction memory flush")) return;
+
+        // Extract actual user text from messages with metadata prefix
+        if (text.includes("message_id") && text.includes("sender_id")) {
+          const parts = text.split(/\n\n/);
+          let extracted = "";
+          for (let j = parts.length - 1; j >= 0; j--) {
+            const part = parts[j].trim();
+            if (!part) continue;
+            if (part.startsWith("{") || part.startsWith("```")) continue;
+            if (part.startsWith("Conversation info") || part.startsWith("Sender (")) continue;
+            extracted = part;
+            break;
+          }
+          if (extracted && extracted.length >= 5) {
+            text = extracted;
+          } else {
+            return;
+          }
+        }
+
+        // Fire-and-forget: send to perceiver → evaluator → encoder pipeline
+        postJSON(`${cfg.serverUrl}/hooks/after-response`, {
+          tenant_id: cfg.tenantId,
+          user_id: cfg.userId,
+          session_id: sessionId,
+          user_message: text,
+          assistant_response: "",
+        }).catch((err) => {
+          api.logger.warn(`brain-memory: after-response failed: ${String(err)}`);
+        });
       } catch (err) {
         api.logger.warn(`brain-memory: agent_end hook failed: ${String(err)}`);
       }
@@ -375,6 +413,10 @@ const brainMemoryPlugin = {
     // --- session_end: generate session summary ---
     api.on("session_end", async (event, ctx) => {
       const sessionKey = ctx.sessionKey || "default";
+
+      // Only process real user conversations
+      if (!isUserSession(sessionKey)) return;
+
       const sessionId = sessionMap.get(sessionKey);
       if (!sessionId) return;
 
