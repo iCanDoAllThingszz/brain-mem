@@ -1,0 +1,19 @@
+server:
+  host: "0.0.0.0"
+  port: 8100
+
+storage:
+  neo4j:
+    uri: "bolt://localhost:7687"
+    user: "neo4j"
+    password: "laolao2026"
+  buffer:
+    path: "./data/buffer.db"
+  tag_dict:
+    path: "./data/tag_dict.json"
+
+llm:
+  base_url: "https://api.minimaxi.com/v1"
+  model: "MiniMax-M2.5"
+  api_key: ""  # 留空则自动从credentials文件读取
+  temperature: 0.3
