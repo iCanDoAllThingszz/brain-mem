@@ -32,8 +32,9 @@ Rules:
 - Be specific, not generic. Include names, dates, numbers when available.
 - Prioritize actionable context over background facts.
 - If a goal is stalled or overdue, highlight it.
-- Write in the same language as the input data.
+- MUST output in Chinese (中文). Do not output in English.
 - Do NOT include thinking process or meta-commentary.
+- Do NOT include information that was not provided in the input data.
 """
 
 
@@ -198,19 +199,20 @@ class WorkingMemory:
     ) -> List[Dict[str, Any]]:
         """Fetch nodes tagged '计划' or '目标' with status=active."""
         goals = []
-        for tag in ["计划", "目标"]:
-            try:
-                nodes = await self.graph.find_active_nodes(tenant_id, user_id)
-                for node in nodes:
-                    if tag in (node.tags or []) and node.status == "active":
-                        goals.append({
-                            "id": node.id,
-                            "name": node.name,
-                            "summary": node.summary,
-                            "tags": node.tags,
-                        })
-            except Exception as e:
-                logger.warning("fetch_active_goals (tag=%s) failed: %s", tag, e)
+        target_tags = {"计划", "目标"}
+        try:
+            nodes = await self.graph.find_active_nodes(tenant_id, user_id)
+            for node in nodes:
+                node_tags = set(node.tags or [])
+                if node_tags & target_tags and node.status == "active":
+                    goals.append({
+                        "id": node.id,
+                        "name": node.name,
+                        "summary": node.summary,
+                        "tags": node.tags,
+                    })
+        except Exception as e:
+            logger.warning("fetch_active_goals failed: %s", e)
         # Deduplicate by id
         seen = set()
         deduped = []

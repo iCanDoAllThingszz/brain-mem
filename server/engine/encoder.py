@@ -25,15 +25,19 @@ logger = logging.getLogger(__name__)
 # Step 1: 粗提取 — 从消息中提取原始实体和关系
 # ---------------------------------------------------------------------------
 _EXTRACT_SYSTEM = """\
-You are an information extraction engine. Extract entities and relationships \
-from the given message. Keep it concise.
+You are an information extraction engine for a PERSONAL memory system. \
+Extract entities and relationships that are specific to this user's life.
 
 Rules:
 - Extract named entities: people, organizations, places, concepts, events, decisions, plans.
+- ONLY extract entities that are relevant to the user personally. \
+  Skip universal common knowledge (e.g., "地球", "太阳", "水") unless the user \
+  has a personal connection to it.
 - Assign a memory zone: semantic / episodic / procedural / emotional.
 - Assign 1-2 preliminary tags per entity (Chinese labels preferred).
 - Ignore garbled/encoded names (like "Gbusrw Jflvnkmwi") — display artifacts.
 - Relation types: UPPER_SNAKE_CASE (e.g., WORKS_AT, DECIDED_TO).
+- If the message mixes common knowledge with personal info, only extract the personal parts.
 
 Return ONLY valid JSON:
 {
