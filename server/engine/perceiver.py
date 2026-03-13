@@ -1,7 +1,11 @@
 """
 Perceiver engine component for the brain-memory service.
 Corresponds to the sensory cortex + thalamus in the human brain.
-Rapidly classifies incoming messages to decide if they warrant further processing.
+
+v2: Beyond classification — also rewrites informative messages into
+high-density, entity-explicit memory inputs. The same query in different
+contexts can carry different meanings, so rewriting uses user profile,
+working memory, and long-term context.
 """
 
 from __future__ import annotations
@@ -14,51 +18,77 @@ from server.engine.llm_client import call_llm_json
 logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = """\
-You are a message classifier for a personal memory system. Your job is to quickly \
-categorize incoming messages to decide if they contain information worth remembering \
-about THIS SPECIFIC USER.
+You are the sensory gateway (thalamus) of a personal memory system. \
+You have TWO jobs:
 
-Classification rules:
+## Job 1: Classify
+Categorize the message into one of three types:
 
-- "noise": Zero information content, OR contains only universal common knowledge \
-  that everyone knows (e.g., "地球是圆的", "天是蓝的", "水是H2O", "今天天气不错").
-  Also includes pure social filler: "嗯嗯", "好的", "哈哈", "OK", "收到", "😄"
+- "noise": Zero personal information content. Includes:
+  * Pure social filler: "嗯嗯", "好的", "哈哈", "OK", "收到"
+  * Universal common knowledge: "地球是圆的", "天是蓝的", "水是H2O"
+  * Generic weather/time remarks with no personal context
 
-- "command": A pure instruction or request that asks the agent to DO something, \
-  with no personal information embedded.
-  Examples: "帮我搜一下X", "查一下天气", "翻译这段话", "设个提醒"
+- "command": A pure instruction with NO personal information embedded.
+  Examples: "翻译这段话", "查一下天气"
 
-- "informative": Contains NEW information specific to this user that is worth \
-  remembering — personal facts, relationships, decisions, plans, opinions, \
-  emotional expressions, or user-specific knowledge.
-  Examples: "我今天去字节面试了", "我决定辞职", "我最近压力很大", "公司要裁员了"
+- "informative": Contains information worth remembering about this user. \
+  This includes EXPLICIT info (facts, decisions, plans) AND IMPLICIT info \
+  (interests revealed by questions, emotions revealed by tone, intentions \
+  revealed by requests).
 
-Key distinction: "informative" means information that is UNIQUE to this user's life, \
-not general knowledge that anyone could look up.
+Key rules:
+- Questions reveal interests: "最近AI agent有啥新动向" → user is interested in AI agents
+- Commands reveal intentions: "帮我搜上海AI公司" → user is researching AI companies
+- Emotions reveal state: "今天好累" → user is fatigued
+- Mixed messages: classify as "informative" if ANY personal info exists
+- When in doubt → "informative" (recall-first principle)
 
-If a message mixes common knowledge with personal info \
-(e.g., "地球是圆的，对了我打算学Rust"), classify as "informative" — \
-the personal part matters even if the rest is noise.
+## Job 2: Rewrite (only when type = "informative")
+Rewrite the original message into a HIGH-DENSITY memory statement that:
+1. Makes the user (subject) explicit — use their name from context
+2. Extracts IMPLICIT information (interests, intentions, emotions, motivations)
+3. Connects to known context (goals, recent events, career plans) when relevant
+4. Strips away common knowledge noise, keeping only personal-relevant parts
+5. Makes entity relationships explicit
 
-If a message is BOTH a command AND informative \
-(e.g., "帮我查一下，我明天要去北京出差"), classify as "informative".
+Examples:
+- Original: "最近ai agent有啥新动向"
+  Context: User is 赵禹, planning to switch to AI startup
+  Rewrite: "赵禹询问AI Agent最新动态，表明他持续关注AI Agent领域，与跳槽AI创业公司的职业规划相关"
 
-When in doubt, prefer "informative" (recall-first principle).
+- Original: "帮我搜一下上海AI公司"
+  Context: User plans to move to Shanghai
+  Rewrite: "赵禹正在调研上海AI公司，这是他跳槽计划的具体行动步骤"
+
+- Original: "今天好累"
+  Context: User has been busy with interviews + work
+  Rewrite: "赵禹表达疲惫感，可能与近期面试和工作双线压力有关"
+
+- Original: "地球是圆的，对了我打算学Rust"
+  Rewrite: "赵禹计划学习Rust语言以拓展技术栈"
+
+- Original: "好的 明天开始记录饮食"
+  Context: User has a weight loss plan, stalled for 4 days
+  Rewrite: "赵禹承诺明天重新开始记录饮食，减肥计划即将恢复"
+
+For "noise" or "command" types, rewrite should be null.
 
 Return ONLY valid JSON:
 {
   "type": "noise" | "command" | "informative",
-  "reason": "one-sentence explanation"
+  "reason": "one-sentence classification explanation",
+  "rewrite": "rewritten high-density memory statement" | null
 }
 """
 
 
 class Perceiver:
     """
-    Rapid message classifier — the sensory gateway of the memory system.
+    Sensory gateway v2 — classifies AND rewrites messages.
 
-    Determines whether a message is worth processing further by classifying it
-    as noise, a command, or informative content.
+    For informative messages, produces a high-density rewrite that makes
+    implicit information explicit, using user context for disambiguation.
     """
 
     async def classify(
@@ -67,35 +97,37 @@ class Perceiver:
         working_memory: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
-        Classify a message into noise / command / informative.
-
-        Args:
-            message: The raw message text to classify.
-            working_memory: Optional session working memory dict. When provided,
-                the user's current goals and context are injected into the prompt
-                to improve classification accuracy.
+        Classify and optionally rewrite a message.
 
         Returns:
             Dict with keys:
                 - "type": "noise" | "command" | "informative"
-                - "reason": str — brief explanation of the decision
+                - "reason": str
+                - "rewrite": str | None — high-density rewrite for informative messages
         """
         user_prompt = self._build_prompt(message, working_memory)
         try:
             result = await call_llm_json(_SYSTEM_PROMPT, user_prompt)
-            # Validate and normalise
             msg_type = result.get("type", "informative")
             if msg_type not in {"noise", "command", "informative"}:
                 logger.warning("Unexpected classify type '%s', defaulting to informative", msg_type)
                 msg_type = "informative"
+
+            rewrite = result.get("rewrite")
+            # Validate rewrite
+            if msg_type != "informative":
+                rewrite = None
+            elif rewrite and len(rewrite.strip()) < 5:
+                rewrite = None
+
             return {
                 "type": msg_type,
                 "reason": result.get("reason", ""),
+                "rewrite": rewrite,
             }
         except Exception as e:
             logger.error("Perceiver.classify failed: %s", e)
-            # Fail-safe: treat as informative so we don't lose data
-            return {"type": "informative", "reason": f"classification error: {e}"}
+            return {"type": "informative", "reason": f"classification error: {e}", "rewrite": None}
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -103,19 +135,42 @@ class Perceiver:
 
     @staticmethod
     def _build_prompt(message: str, working_memory: Optional[Dict[str, Any]]) -> str:
-        """Build the user prompt, optionally injecting working memory context."""
-        parts = [f'Message to classify:\n"""\n{message}\n"""']
+        """Build the user prompt with rich context for accurate classification and rewriting."""
+        parts = [f'Message:\n"""\n{message}\n"""']
 
         if working_memory:
             context_parts = []
+
+            # User identity
+            raw = working_memory.get("raw", {})
+            profile = raw.get("user_profile", {})
+            if profile:
+                context_parts.append(f"User profile: {profile}")
+
+            # Active goals
             if working_memory.get("user_goals"):
                 goals = ", ".join(working_memory["user_goals"])
-                context_parts.append(f"User's current goals: {goals}")
+                context_parts.append(f"Active goals: {goals}")
+
+            # Recent events
+            events = raw.get("recent_events", [])
+            if events:
+                event_text = "; ".join(
+                    e.get("summary") or e.get("name", "") for e in events[:5]
+                )
+                context_parts.append(f"Recent events: {event_text}")
+
+            # Session context (WM summary)
             if working_memory.get("context"):
-                # Truncate to avoid token bloat
-                ctx = working_memory["context"][:500]
-                context_parts.append(f"Session context: {ctx}")
+                ctx = working_memory["context"][:400]
+                context_parts.append(f"Current context: {ctx}")
+
+            # Emotional baseline
+            baseline = working_memory.get("emotional_baseline", "neutral")
+            if baseline != "neutral":
+                context_parts.append(f"Emotional state: {baseline}")
+
             if context_parts:
-                parts.append("Background context:\n" + "\n".join(context_parts))
+                parts.append("User context (use for rewriting):\n" + "\n".join(context_parts))
 
         return "\n\n".join(parts)

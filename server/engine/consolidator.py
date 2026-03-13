@@ -34,6 +34,20 @@ Return ONLY valid JSON:
 }
 """
 
+_ORPHAN_RELATION_SYSTEM = """\
+You are a knowledge graph relationship builder. Given orphan nodes (no relationships) \
+and connected nodes, suggest relationships.
+
+Rules:
+- Only suggest clearly implied relationships. Do NOT guess.
+- Relation types: UPPER_SNAKE_CASE (e.g., WEIGHS, INTERESTED_IN, PART_OF).
+- Maximum 1 relationship per orphan. Keep descriptions SHORT (under 10 words).
+- If no clear relationship exists for an orphan, skip it.
+
+Return ONLY valid JSON:
+{"suggested_relations": [{"from_name": "A", "to_name": "B", "type": "REL", "description": "short"}]}
+"""
+
 
 class Consolidator:
     """Memory consolidator — sleep consolidation mechanism."""
@@ -54,6 +68,12 @@ class Consolidator:
         units = self.buffer.read_unarchived(tenant_id, user_id)
         if not units:
             logger.info("No unarchived units for tenant=%s user=%s", tenant_id, user_id)
+            # Still run orphan repair even with no new units
+            try:
+                orphan_rels = await self._repair_orphans(tenant_id, user_id, {})
+                stats["relations_created"] += orphan_rels
+            except Exception as e:
+                logger.warning("Orphan repair failed: %s", e)
             return stats
 
         valid_units = [u for u in units if float(u.get("importance", 0)) >= 3.0]
@@ -103,6 +123,13 @@ class Consolidator:
         patterns, conflicts = await self._discover_patterns(valid_units)
         stats["patterns_discovered"] = patterns
         stats["conflicts_found"] = conflicts
+
+        # Step 5.5: Repair orphan nodes (suggest missing relations)
+        try:
+            orphan_rels = await self._repair_orphans(tenant_id, user_id, name_to_id)
+            stats["relations_created"] += orphan_rels
+        except Exception as e:
+            logger.warning("Orphan repair failed: %s", e)
 
         try:
             await self.graph.apply_decay(tenant_id, user_id)
@@ -268,3 +295,67 @@ class Consolidator:
         except Exception as e:
             logger.warning("Pattern discovery failed: %s", e)
             return [], []
+
+    async def _repair_orphans(
+        self, tenant_id: str, user_id: str, name_to_id: Dict[str, str]
+    ) -> int:
+        """Find orphan nodes and suggest missing relationships via LLM."""
+        all_nodes = await self.graph.find_active_nodes(tenant_id, user_id)
+        
+        orphans = []
+        connected = []
+        for node in all_nodes:
+            rels = await self.graph.get_relations(node.id)
+            info = {"name": node.name, "tags": node.tags, "summary": node.summary or "", "id": node.id}
+            if not rels:
+                orphans.append(info)
+            else:
+                connected.append(info)
+        
+        if not orphans or not connected:
+            return 0
+        
+        orphan_text = "\n".join(f"- {o['name']} (tags={o['tags']}, summary={o['summary'][:60]})" for o in orphans)
+        connected_text = "\n".join(f"- {c['name']} (tags={c['tags']}, summary={c['summary'][:60]})" for c in connected[:20])
+        
+        user_prompt = f"Orphan nodes (no relationships):\n{orphan_text}\n\nConnected nodes:\n{connected_text}"
+        
+        try:
+            result = await call_llm_json(_ORPHAN_RELATION_SYSTEM, user_prompt, temperature=0.1)
+        except Exception as e:
+            logger.warning("Orphan relation suggestion failed: %s", e)
+            return 0
+        
+        # Build name→id map for all nodes
+        all_name_to_id = {n.name: n.id for n in all_nodes}
+        all_name_to_id.update(name_to_id)
+        
+        created = 0
+        for rel in result.get("suggested_relations", []):
+            from_name = rel.get("from_name", "")
+            to_name = rel.get("to_name", "")
+            rel_type = rel.get("type", "RELATED_TO").upper().replace(" ", "_")
+            
+            from_id = all_name_to_id.get(from_name)
+            to_id = all_name_to_id.get(to_name)
+            if not from_id or not to_id:
+                continue
+            
+            try:
+                relation = Relation(
+                    from_id=from_id, to_id=to_id, type=rel_type,
+                    description=rel.get("description", ""),
+                    valid_from=datetime.utcnow(),
+                    source_session="consolidator-orphan-repair",
+                )
+                await self.graph.create_relation(relation)
+                created += 1
+                log_event("consolidation_orphan_repair", f"{from_name} -{rel_type}-> {to_name}", {
+                    "from": from_name, "to": to_name, "type": rel_type,
+                })
+            except Exception as e:
+                logger.warning("Failed to create orphan relation %s->%s: %s", from_name, to_name, e)
+        
+        if created:
+            logger.info("Repaired %d orphan relationships", created)
+        return created
