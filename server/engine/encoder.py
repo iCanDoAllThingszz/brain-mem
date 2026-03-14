@@ -166,6 +166,11 @@ class Encoder:
             return await self._encode_reconsolidation(
                 message, evaluation, tenant_id, user_id, session_id
             )
+        elif category == "prospective":
+            # Prospective memory flow: create trigger nodes
+            return await self._encode_prospective(
+                message, evaluation, tenant_id, user_id, session_id
+            )
         else:
             logger.warning("Unknown category '%s', defaulting to cognition", category)
             return await self._encode_cognition(
@@ -311,11 +316,10 @@ class Encoder:
             "file_path": file_path,
             "entities": [],
             "relations": [],
-            "session_id": session_id,
+            "importance": self._compute_importance(evaluation),
             "timestamp": datetime.utcnow().isoformat(),
         }
-        importance = self._compute_importance(evaluation)
-        self.buffer.write(buffer_unit, tenant_id, user_id, session_id, importance)
+        self.buffer.write(tenant_id, user_id, session_id, buffer_unit)
 
         logger.info(
             "Encoded log entry (category=%s, target=%s, file=%s, buffer=yes)",
@@ -439,6 +443,91 @@ class Encoder:
             "nodes_updated": 1,
             "old_version": node.version,
             "new_version": node.version + 1,
+            "session_id": session_id,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+
+    async def _encode_prospective(
+        self,
+        message: str,
+        evaluation: Dict[str, Any],
+        tenant_id: str,
+        user_id: str,
+        session_id: str,
+    ) -> Dict[str, Any]:
+        """
+        Prospective memory encoding flow: create trigger nodes.
+
+        Args:
+            message: Original message content
+            evaluation: Evaluation dict (contains trigger_type, trigger_value, action)
+            tenant_id: Tenant ID
+            user_id: User ID
+            session_id: Session ID
+
+        Returns:
+            Dict with keys: type="prospective", node_id, trigger_type, trigger_value, action
+        """
+        trigger_type = evaluation.get("trigger_type")
+        trigger_value = evaluation.get("trigger_value")
+        action = evaluation.get("action")
+
+        if not trigger_type or not trigger_value or not action:
+            logger.warning("Prospective memory missing required fields, skipping")
+            return {"skipped": True, "reason": "missing_required_fields"}
+
+        # Create a memory node for the prospective memory
+        node_id = str(uuid.uuid4())
+        node = Node(
+            id=node_id,
+            name=f"提醒: {action[:30]}",
+            tags=["计划", "提醒"],
+            zone="procedural",
+            summary=f"{trigger_type}触发器: {action}",
+            content=message,
+            importance=8.0,  # High importance for reminders
+            properties={
+                "trigger_type": trigger_type,
+                "trigger_value": trigger_value,
+                "action": action,
+                "status": "pending",
+                "created_from": message,
+                "session_id": session_id,
+            },
+        )
+
+        # Write directly to graph (bypass buffer/consolidation for immediate availability)
+        await self.graph.create_node(node, tenant_id, user_id)
+
+        # Also write to buffer for retriever discoverability
+        buffer_unit = {
+            "id": str(uuid.uuid4()),
+            "type": "prospective_index",
+            "message": f"[提醒] {action} (触发条件: {trigger_value})",
+            "category": "prospective",
+            "trigger_type": trigger_type,
+            "trigger_value": trigger_value,
+            "action": action,
+            "node_id": node_id,
+            "entities": [],
+            "relations": [],
+            "importance": 8.0,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+        self.buffer.write(tenant_id, user_id, session_id, buffer_unit)
+
+        logger.info(
+            "Encoded prospective memory (type=%s, trigger=%s, action=%s, node=%s)",
+            trigger_type, trigger_value, action, node_id[:8]
+        )
+
+        return {
+            "type": "prospective",
+            "node_id": node_id,
+            "trigger_type": trigger_type,
+            "trigger_value": trigger_value,
+            "action": action,
+            "status": "pending",
             "session_id": session_id,
             "timestamp": datetime.utcnow().isoformat(),
         }

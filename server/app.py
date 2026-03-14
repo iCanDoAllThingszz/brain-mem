@@ -17,6 +17,7 @@ from server.engine.encoder import Encoder
 from server.engine.retriever import Retriever
 from server.engine.consolidator import Consolidator
 from server.engine.working_memory import WorkingMemory
+from server.engine.prospective_checker import ProspectiveChecker
 from server.engine.llm_client import configure as configure_llm
 from server.activity_log import log_event, read_recent
 
@@ -87,6 +88,7 @@ async def lifespan(app: FastAPI):
     app.state.retriever = Retriever(graph, buffer)
     app.state.consolidator = Consolidator(graph, tag_dict, buffer)
     app.state.working_memory = WorkingMemory(graph, buffer)
+    app.state.prospective_checker = ProspectiveChecker(graph)
 
     logger.info("All components initialized.")
     yield
@@ -134,6 +136,11 @@ class ConsolidateRequest(BaseModel):
     user_id: str
 
 
+class CheckProspectiveRequest(BaseModel):
+    tenant_id: str
+    user_id: str
+
+
 def ok(data: Any) -> dict:
     return {"code": 0, "message": "success", "data": data}
 
@@ -171,18 +178,32 @@ async def session_start(req: SessionStartRequest, request: Request):
     logger.info("session-start | tenant=%s user=%s session=%s", req.tenant_id, req.user_id, req.session_id)
     try:
         wm = request.app.state.working_memory
+        prospective_checker = request.app.state.prospective_checker
+
+        # Check for time-based prospective memory triggers
+        triggered_reminders = await prospective_checker.check_time_triggers(
+            req.tenant_id, req.user_id
+        )
+
         result = await wm.load(
             req.tenant_id, req.user_id, req.session_id,
             req.user_profile, req.agent_context,
         )
+
+        # Add triggered reminders to pending_reminders
+        pending_reminders = result.get("pending_reminders", [])
+        for reminder in triggered_reminders:
+            pending_reminders.append(reminder['action'])
+
         ctx = result.get("context", "")
         log_event("hook_session_start", f"Loaded WM for session {req.session_id[:8]}", {
             "goals": result.get("user_goals", []),
-            "reminders": result.get("pending_reminders", []),
+            "reminders": pending_reminders,
             "emotional_baseline": result.get("emotional_baseline", "neutral"),
             "context": ctx[:200] if ctx else "",
+            "triggered_time_reminders": len(triggered_reminders),
         })
-        return ok({"context": ctx, "pending_reminders": result.get("pending_reminders", [])})
+        return ok({"context": ctx, "pending_reminders": pending_reminders})
     except Exception as exc:
         logger.exception("session-start failed: %s", exc)
         return JSONResponse(status_code=500, content=err(500, str(exc)))
@@ -194,17 +215,36 @@ async def before_query(req: BeforeQueryRequest, request: Request):
     try:
         wm_store = request.app.state.working_memory
         retriever = request.app.state.retriever
+        prospective_checker = request.app.state.prospective_checker
+
+        # Check for event-based prospective memory triggers
+        triggered_reminders = await prospective_checker.check_event_triggers(
+            req.tenant_id, req.user_id, req.query
+        )
 
         wm = wm_store.get(req.session_id)
         result = await retriever.retrieve(
             req.query, req.tenant_id, req.user_id, wm, max_results=10, session_id=req.session_id
         )
         memories = result.get("memories", [])
+
+        # Inject triggered reminders into context
+        context = result.get("context", "")
+        if triggered_reminders:
+            reminder_text = "\n\n【提醒事项】\n" + "\n".join(
+                f"- {r['action']}" for r in triggered_reminders
+            )
+            context = context + reminder_text
+            log_event("prospective_trigger", f"Event triggers activated: {len(triggered_reminders)}", {
+                "triggers": [r['action'] for r in triggered_reminders],
+            })
+
         log_event("hook_before_query", f"Query: {req.query[:80]}", {
             "memories_found": len(memories),
             "top_memories": [f"{m.get('content', '')[:60]} (score={m.get('relevance', 0):.2f})" for m in memories[:3]],
+            "triggered_reminders": len(triggered_reminders),
         })
-        return ok({"context": result.get("context", "")})
+        return ok({"context": context})
     except Exception as exc:
         logger.exception("before-query failed: %s", exc)
         return JSONResponse(status_code=500, content=err(500, str(exc)))
@@ -239,20 +279,24 @@ async def _process_after_response(
             memory_input = rewrite or user_message
             category = perception.get("category", "cognition")
 
-            # Log-type and reconsolidation messages bypass evaluator
+            # Log-type, reconsolidation, and prospective messages bypass evaluator
             # Logs are always worth recording, reconsolidations are user-initiated corrections
-            if category.startswith("log_") or category == "reconsolidation":
+            # Prospective memories are always important (reminders)
+            if category.startswith("log_") or category == "reconsolidation" or category == "prospective":
                 evaluation = {
                     "task_relevance": 5,
                     "emotional_intensity": 0,
                     "emotion_type": "neutral",
                     "novelty": 5,
                     "encode_decision": True,
-                    "encode_priority": "low",
+                    "encode_priority": "high" if category == "prospective" else "low",
                     "reason": f"{category} message, auto-encode",
                     "category": category,
                     "target_entity": perception.get("target_entity"),
                     "correction_type": perception.get("correction_type"),
+                    "trigger_type": perception.get("trigger_type"),
+                    "trigger_value": perception.get("trigger_value"),
+                    "action": perception.get("action"),
                 }
                 log_event("evaluator", f"[auto-pass] category={category}", {
                     "encode_decision": True,
@@ -267,10 +311,13 @@ async def _process_after_response(
                 })
 
             if evaluation.get("encode_decision"):
-                # Pass category, target_entity, and correction_type to encoder
+                # Pass category, target_entity, correction_type, and prospective fields to encoder
                 evaluation["category"] = perception.get("category", "cognition")
                 evaluation["target_entity"] = perception.get("target_entity")
                 evaluation["correction_type"] = perception.get("correction_type")
+                evaluation["trigger_type"] = perception.get("trigger_type")
+                evaluation["trigger_value"] = perception.get("trigger_value")
+                evaluation["action"] = perception.get("action")
 
                 # Encode the rewrite (higher density) but store original message too
                 result = await encoder.encode_message(
@@ -366,3 +413,32 @@ async def consolidate(req: ConsolidateRequest, request: Request, background_task
         request.app.state.consolidator,
     )
     return ok({"status": "accepted", "task_id": task_id})
+
+
+@app.post("/hooks/check-prospective")
+async def check_prospective(req: CheckProspectiveRequest, request: Request):
+    """
+    Check for time-based prospective memory triggers.
+    This endpoint can be called by external cron jobs or on session-start.
+    """
+    logger.info("check-prospective | tenant=%s user=%s", req.tenant_id, req.user_id)
+    try:
+        prospective_checker = request.app.state.prospective_checker
+
+        # Check for time-based triggers
+        triggered_reminders = await prospective_checker.check_time_triggers(
+            req.tenant_id, req.user_id
+        )
+
+        if triggered_reminders:
+            log_event("prospective_trigger", f"Time triggers activated: {len(triggered_reminders)}", {
+                "triggers": [r['action'] for r in triggered_reminders],
+            })
+
+        return ok({
+            "triggered_count": len(triggered_reminders),
+            "reminders": triggered_reminders,
+        })
+    except Exception as exc:
+        logger.exception("check-prospective failed: %s", exc)
+        return JSONResponse(status_code=500, content=err(500, str(exc)))
