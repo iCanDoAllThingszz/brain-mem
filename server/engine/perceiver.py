@@ -98,9 +98,12 @@ For "noise" or "command" types, rewrite should be null.
 Return ONLY valid JSON:
 {
   "type": "noise" | "command" | "informative",
-  "category": "cognition" | "log_diet" | "log_exercise" | "log_interview" | "log_trading" | "log_learning" | "log_general" | "reconsolidation",
+  "category": "cognition" | "log_diet" | "log_exercise" | "log_interview" | "log_trading" | "log_learning" | "log_general" | "reconsolidation" | "prospective",
   "target_entity": "entity name that should be updated (e.g., '减肥计划', '跳槽计划')" | null,
   "correction_type": "correct" | "supplement" | "reframe" | null,
+  "trigger_type": "time" | "event" | "condition" | null,
+  "trigger_value": "具体触发条件" | null,
+  "action": "要做的事" | null,
   "reason": "one-sentence classification explanation",
   "rewrite": "rewritten high-density memory statement" | null
 }
@@ -128,9 +131,23 @@ Category rules:
     * "correct": Factual correction (e.g., "不对，我当时说的是感觉很好") \
     * "supplement": Adding new information (e.g., "腾讯一面过了，下周二面") \
     * "reframe": Emotional reinterpretation (e.g., "美团那段时间其实很痛苦")
+- "prospective": User is setting a reminder or intention for the FUTURE. \
+  This is prospective memory — remembering to do something later. \
+  ALWAYS set trigger_type: \
+    * "time": Time-based trigger (e.g., "明天提醒我交报告" → trigger_value="2026-03-15 09:00") \
+    * "event": Event-based trigger (e.g., "下次聊到面试时问问字节结果" → trigger_value="面试") \
+    * "condition": Condition-based trigger (e.g., "如果BTC跌破6万提醒我" → trigger_value="BTC<60000") \
+  ALWAYS set trigger_value: The specific trigger condition (time in ISO format, event keyword, or condition expression) \
+  ALWAYS set action: What to do when triggered (e.g., "提醒交报告", "问字节面试结果") \
+  For time triggers, parse relative times like "明天", "下周" into absolute ISO datetime (Beijing time UTC+8). \
+  Examples: \
+    * "明天早上9点提醒我交报告" → trigger_type="time", trigger_value="2026-03-15T09:00:00+08:00", action="提醒交报告" \
+    * "下次聊到减肥时提醒我记录饮食" → trigger_type="event", trigger_value="减肥", action="提醒记录饮食" \
+    * "如果BTC跌破6万提醒我" → trigger_type="condition", trigger_value="BTC<60000", action="提醒BTC跌破6万"
 
 For log categories, ALWAYS set target_entity (use the defaults above if unsure).
 For reconsolidation category, ALWAYS set target_entity and correction_type.
+For prospective category, ALWAYS set trigger_type, trigger_value, and action.
 For cognition category or noise/command types, target_entity and correction_type should be null.
 """
 
@@ -179,7 +196,7 @@ class Perceiver:
             category = result.get("category", "cognition")
             valid_categories = {
                 "cognition", "log_diet", "log_exercise", "log_interview",
-                "log_trading", "log_learning", "log_general", "reconsolidation"
+                "log_trading", "log_learning", "log_general", "reconsolidation", "prospective"
             }
             if category not in valid_categories:
                 logger.warning("Unexpected category '%s', defaulting to cognition", category)
@@ -187,11 +204,17 @@ class Perceiver:
 
             target_entity = result.get("target_entity")
             correction_type = result.get("correction_type")
+            trigger_type = result.get("trigger_type")
+            trigger_value = result.get("trigger_value")
+            action = result.get("action")
 
             # Validate target_entity and correction_type based on category
             if msg_type != "informative" or category == "cognition":
                 target_entity = None
                 correction_type = None
+                trigger_type = None
+                trigger_value = None
+                action = None
             elif category == "reconsolidation":
                 # Reconsolidation requires both target_entity and correction_type
                 if not target_entity:
@@ -201,15 +224,40 @@ class Perceiver:
                 elif correction_type not in {"correct", "supplement", "reframe"}:
                     logger.warning("Invalid correction_type '%s', defaulting to 'correct'", correction_type)
                     correction_type = "correct"
-            else:
-                # Other categories don't use correction_type
+                trigger_type = None
+                trigger_value = None
+                action = None
+            elif category == "prospective":
+                # Prospective requires trigger_type, trigger_value, and action
+                if not trigger_type or not trigger_value or not action:
+                    logger.warning("Prospective missing required fields, defaulting to cognition")
+                    category = "cognition"
+                    trigger_type = None
+                    trigger_value = None
+                    action = None
+                elif trigger_type not in {"time", "event", "condition"}:
+                    logger.warning("Invalid trigger_type '%s', defaulting to cognition", trigger_type)
+                    category = "cognition"
+                    trigger_type = None
+                    trigger_value = None
+                    action = None
+                target_entity = None
                 correction_type = None
+            else:
+                # Other categories don't use correction_type or prospective fields
+                correction_type = None
+                trigger_type = None
+                trigger_value = None
+                action = None
 
             return {
                 "type": msg_type,
                 "category": category,
                 "target_entity": target_entity,
                 "correction_type": correction_type,
+                "trigger_type": trigger_type,
+                "trigger_value": trigger_value,
+                "action": action,
                 "reason": result.get("reason", ""),
                 "rewrite": rewrite,
             }
@@ -220,6 +268,9 @@ class Perceiver:
                 "category": "cognition",
                 "target_entity": None,
                 "correction_type": None,
+                "trigger_type": None,
+                "trigger_value": None,
+                "action": None,
                 "reason": f"classification error: {e}",
                 "rewrite": None
             }
