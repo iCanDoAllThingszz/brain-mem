@@ -33,6 +33,9 @@ Rules:
 - ONLY extract entities that are relevant to the user personally. \
   Skip universal common knowledge (e.g., "地球", "太阳", "水") unless the user \
   has a personal connection to it.
+- **PRONOUN RESOLUTION**: Replace pronouns like "我", "用户", "本人" with the user's actual name \
+  from context (e.g., "赵禹"). Never create an entity named "用户" or "我" — always resolve to \
+  the real person. If the user's name is unknown, use "用户本人" as a placeholder.
 - Assign a memory zone: semantic / episodic / procedural / emotional.
 - Assign 1-2 preliminary tags per entity (Chinese labels preferred).
 - Ignore garbled/encoded names (like "Gbusrw Jflvnkmwi") — display artifacts.
