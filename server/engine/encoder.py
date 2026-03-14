@@ -277,6 +277,18 @@ class Encoder:
 
         unit_id = self.buffer.write(tenant_id, user_id, session_id, memory_unit)
         memory_unit["id"] = unit_id
+
+        # Generate embedding for buffer unit (async, fire-and-forget style)
+        try:
+            from server.engine.embedding_client import get_embedding
+            import numpy as np
+            emb_text = f"{message}"
+            embedding = await get_embedding(emb_text, type_="db")
+            if any(v != 0.0 for v in embedding[:10]):
+                self.buffer.update_embedding(unit_id, np.array(embedding, dtype=np.float32).tobytes())
+        except Exception as e:
+            logger.warning("Failed to generate buffer embedding: %s", e)
+
         logger.info(
             "Encoded memory unit %s (priority=%s, entities=%d, relations=%d)",
             unit_id,
