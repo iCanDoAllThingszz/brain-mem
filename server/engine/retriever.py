@@ -135,6 +135,10 @@ class Retriever:
 
         # Step 2: Extract search clues
         clues = await self._extract_clues(query)
+        # Guard against LLM returning non-dict (e.g., list)
+        if not isinstance(clues, dict):
+            logger.warning('_extract_clues returned %s instead of dict, using fallback', type(clues).__name__)
+            clues = {"entities": [], "keywords": [query], "time_hint": "none", "query_intent": query, "query_emotion": "neutral"}
         entities = clues.get("entities", [])
         keywords = clues.get("keywords", [])
         query_emotion = clues.get("query_emotion", "neutral")

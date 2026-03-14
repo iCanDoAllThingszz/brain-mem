@@ -377,8 +377,19 @@ class Encoder:
             nodes = await self.graph.find_nodes_fuzzy(target_entity, tenant_id, user_id)
 
         if not nodes:
-            logger.warning("Target entity '%s' not found for reconsolidation", target_entity)
-            return {"skipped": True, "reason": "target_entity_not_found", "target_entity": target_entity}
+            # Auto-create the target entity if it doesn't exist
+            # (reconsolidation implies the user believes this entity should exist)
+            logger.info("Target entity '%s' not found, auto-creating for reconsolidation", target_entity)
+            from server.models.node import Node as NodeModel
+            new_node = NodeModel(
+                name=target_entity,
+                tags=["计划"],
+                summary=message[:100],
+                zone="semantic",
+                importance=6.0,
+            )
+            node = await self.graph.create_node(new_node, tenant_id, user_id)
+            nodes = [node]
 
         # Use the first matching node (most relevant)
         node = nodes[0]
