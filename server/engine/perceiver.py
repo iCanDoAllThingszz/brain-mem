@@ -105,15 +105,23 @@ Return ONLY valid JSON:
 }
 
 Category rules:
-- "cognition": Information that directly affects user profile, goals, decisions, relationships, or milestones
-- "log_diet": Diet/food records (should update a weight loss or health plan entity)
-- "log_exercise": Exercise/workout records (should update a fitness plan entity)
-- "log_interview": Interview feedback or progress (should update a job search plan entity)
-- "log_trading": Trading records or market observations (should update a trading plan entity)
-- "log_learning": Learning notes or study records (should update a learning plan entity)
+- "cognition": Information that directly affects user profile, goals, DECISIONS, relationships, or milestones. \
+  IMPORTANT: Decisions and plans are ALWAYS cognition, even if they relate to learning/exercise/diet. \
+  Examples: "我决定学Rust" → cognition (decision), "我打算开始减肥" → cognition (plan), \
+  "腾讯面试过了" → cognition (milestone)
+- "log_diet": ONLY actual diet/food consumption records. E.g., "吃了苹果", "午餐牛肉面600大卡". \
+  Default target_entity: "减肥计划"
+- "log_exercise": ONLY actual exercise/workout records. E.g., "跑了5公里", "做了30个俯卧撑". \
+  Default target_entity: "减肥计划"
+- "log_interview": ONLY interview session details/feedback. E.g., "腾讯二面聊了分布式系统". \
+  Default target_entity: "跳槽计划"
+- "log_trading": ONLY trading records or market observations. E.g., "买了0.1个BTC". \
+  Default target_entity: "量化交易"
+- "log_learning": ONLY actual study notes or learning records. E.g., "今天学了Rust的所有权机制". \
+  NOT decisions to learn something (that's cognition).
 - "log_general": Other log-type information that doesn't fit above categories
 
-For log categories, identify the target_entity that should be updated (e.g., "减肥计划", "跳槽计划").
+For log categories, ALWAYS set target_entity (use the defaults above if unsure).
 For cognition category or noise/command types, target_entity should be null.
 """
 

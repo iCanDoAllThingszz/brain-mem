@@ -237,13 +237,32 @@ async def _process_after_response(
         if msg_type == "informative":
             # Use rewrite for evaluation and encoding if available
             memory_input = rewrite or user_message
-            evaluation = await evaluator.evaluate(memory_input, wm)
+            category = perception.get("category", "cognition")
 
-            log_event("evaluator", f"relevance={evaluation.get('task_relevance')} emotion={evaluation.get('emotional_intensity')} novelty={evaluation.get('novelty')}", {
-                "encode_decision": evaluation.get("encode_decision"),
-                "encode_priority": evaluation.get("encode_priority"),
-                "reason": evaluation.get("reason", ""),
-            })
+            # Log-type messages bypass evaluator — logs are always worth recording
+            if category.startswith("log_"):
+                evaluation = {
+                    "task_relevance": 5,
+                    "emotional_intensity": 0,
+                    "emotion_type": "neutral",
+                    "novelty": 5,
+                    "encode_decision": True,
+                    "encode_priority": "low",
+                    "reason": f"log-type message ({category}), auto-encode",
+                    "category": category,
+                    "target_entity": perception.get("target_entity"),
+                }
+                log_event("evaluator", f"[auto-pass] category={category}", {
+                    "encode_decision": True,
+                    "reason": f"log-type auto-encode ({category})",
+                })
+            else:
+                evaluation = await evaluator.evaluate(memory_input, wm)
+                log_event("evaluator", f"relevance={evaluation.get('task_relevance')} emotion={evaluation.get('emotional_intensity')} novelty={evaluation.get('novelty')}", {
+                    "encode_decision": evaluation.get("encode_decision"),
+                    "encode_priority": evaluation.get("encode_priority"),
+                    "reason": evaluation.get("reason", ""),
+                })
 
             if evaluation.get("encode_decision"):
                 # Pass category and target_entity to encoder
