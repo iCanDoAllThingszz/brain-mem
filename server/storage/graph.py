@@ -590,7 +590,7 @@ class GraphStore:
 
     async def ensure_vector_index(self):
         """Create vector index for MemoryNode embeddings if not exists."""
-        async with self.driver.session() as session:
+        async with self._driver.session() as session:
             result = await session.run(
                 "SHOW INDEXES YIELD name WHERE name = 'memory_embedding' RETURN count(*) as count"
             )
@@ -609,7 +609,7 @@ class GraphStore:
 
     async def update_node_embedding(self, node_id: str, embedding: list):
         """Update the embedding property of a MemoryNode."""
-        async with self.driver.session() as session:
+        async with self._driver.session() as session:
             await session.run(
                 "MATCH (n:MemoryNode {id: $id}) SET n.embedding = $embedding",
                 id=node_id, embedding=embedding
@@ -617,7 +617,7 @@ class GraphStore:
 
     async def vector_search(self, query_embedding: list, top_k: int = 10, min_score: float = 0.5) -> list:
         """Vector similarity search on MemoryNodes."""
-        async with self.driver.session() as session:
+        async with self._driver.session() as session:
             result = await session.run("""
                 CALL db.index.vector.queryNodes('memory_embedding', $top_k, $embedding)
                 YIELD node, score
@@ -630,7 +630,7 @@ class GraphStore:
 
     async def find_nodes_without_embedding(self, tenant_id: str, user_id: str) -> list:
         """Find all active nodes that don't have an embedding yet."""
-        async with self.driver.session() as session:
+        async with self._driver.session() as session:
             result = await session.run("""
                 MATCH (n:MemoryNode {tenant_id: $tid, user_id: $uid})
                 WHERE n.embedding IS NULL AND n.status = 'active'
