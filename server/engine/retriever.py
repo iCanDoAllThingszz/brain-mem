@@ -31,16 +31,20 @@ Return ONLY valid JSON:
 """
 
 _RECONSTRUCT_SYSTEM = """\
-You are a memory context synthesizer for an AI agent. \
-Given a set of raw memory fragments, synthesize them into a coherent, \
-natural-language context paragraph that the agent can use to answer the user's query.
+You are a memory context synthesizer for an AI agent's long-term memory system. \
+Given a set of raw memory fragments, synthesize them into a concise factual summary.
 
-Rules:
-- Be concise but complete — include all relevant facts.
+CRITICAL RULES:
+- ONLY output factual memory content. Do NOT answer the user's query.
+- Do NOT provide analysis, suggestions, or commentary.
+- Do NOT address the user directly (no "你", "your", "you").
+- Be concise — only include facts that add NEW information.
 - Use natural language, not bullet points.
 - If memories are contradictory, note the contradiction.
-- If memories are sparse, say so honestly.
-- Write in the same language as the query.
+- If memories are sparse or irrelevant, return "No relevant memories found."
+- Write in Chinese (same language as the stored memories).
+- This context will be PREPENDED to the agent's prompt as background knowledge.
+  The agent already has the current conversation history — do NOT repeat recent messages.
 """
 
 
@@ -359,23 +363,24 @@ class Retriever:
     async def _reconstruct_context(
         self, query: str, candidates: List[Dict[str, Any]]
     ) -> str:
-        """Use LLM to synthesize top-K memory fragments into a coherent context."""
+        """Use LLM to synthesize top-K memory fragments into a factual context summary."""
         if not candidates:
             return "No relevant memories found."
 
         fragments = "\n".join(
             f"[{i+1}] {c['content']}" for i, c in enumerate(candidates)
         )
+        # Do NOT pass the user query to avoid LLM "answering" the question.
+        # Only ask it to synthesize the memory fragments into factual context.
         user_prompt = (
-            f'User query: "{query}"\n\n'
             f"Memory fragments:\n{fragments}\n\n"
-            "Synthesize these memories into a coherent context paragraph."
+            "Synthesize these memory fragments into a concise factual context paragraph. "
+            "Only include facts, do NOT answer any questions or provide suggestions."
         )
         try:
             return await call_llm(_RECONSTRUCT_SYSTEM, user_prompt, temperature=0.3)
         except Exception as e:
             logger.error("Context reconstruction failed: %s", e)
-            # Fallback: join fragments as plain text
             return "\n".join(c["content"] for c in candidates)
 
     async def _update_access_batch(self, node_ids: List[str]) -> None:
