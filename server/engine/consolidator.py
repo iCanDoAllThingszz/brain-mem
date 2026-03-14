@@ -9,6 +9,7 @@ v2: Adapted for encoder v2 (action/aliases_to_add/tag merge) + per-unit archive.
 from __future__ import annotations
 
 import logging
+import random
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -46,6 +47,26 @@ Rules:
 
 Return ONLY valid JSON:
 {"suggested_relations": [{"from_name": "A", "to_name": "B", "type": "REL", "description": "short"}]}
+"""
+
+_CREATIVE_RECOMBINATION_SYSTEM = """\
+You are a creative thinking engine. Below are several memory fragments from a user's knowledge graph.
+
+Try to discover valuable potential connections or insights between these fragments.
+
+Rules:
+- Only return truly valuable, actionable insights
+- Do NOT force connections between unrelated things
+- Insights should be practically helpful (side business opportunities, learning directions, problem solutions, etc.)
+- If there is no meaningful connection, return {"insight": null}
+
+Return ONLY valid JSON:
+{
+  "insight": "one-sentence insight description" | null,
+  "reasoning": "why these fragments are connected",
+  "actionable": "how the user can leverage this insight",
+  "source_nodes": ["node_name1", "node_name2"]
+}
 """
 
 
@@ -144,6 +165,13 @@ class Consolidator:
             stats["relations_created"] += orphan_rels
         except Exception as e:
             logger.warning("Orphan repair failed: %s", e)
+
+        # Step 5.6: Creative recombination (after pattern discovery)
+        try:
+            insights_created = await self._creative_recombination(tenant_id, user_id)
+            stats["insights_created"] = insights_created
+        except Exception as e:
+            logger.warning("Creative recombination failed: %s", e)
 
         try:
             await self.graph.apply_decay(tenant_id, user_id)
@@ -507,4 +535,144 @@ How should we resolve this conflict?"""
 
         except Exception as e:
             logger.error("Conflict resolution scan failed: %s", e)
+            return 0
+
+    # ------------------------------------------------------------------
+    # Creative recombination
+    # ------------------------------------------------------------------
+
+    async def _creative_recombination(self, tenant_id: str, user_id: str) -> int:
+        """
+        创造性重组：随机组合不同记忆片段，尝试发现有价值的洞察。
+
+        模拟REM睡眠期间的创造性思维过程。大部分尝试会失败（返回null），
+        这是正常的。只有偶尔会产生有价值的洞察。
+
+        Args:
+            tenant_id: 租户ID
+            user_id: 用户ID
+
+        Returns:
+            创建的洞察节点数量
+        """
+        try:
+            # 1. 获取所有active节点，按zone分组
+            all_nodes = await self.graph.find_active_nodes(tenant_id, user_id)
+            if len(all_nodes) < 5:
+                # 节点太少，无法进行有意义的重组
+                return 0
+
+            episodic_nodes = [n for n in all_nodes if n.zone == "episodic"]
+            semantic_nodes = [n for n in all_nodes if n.zone == "semantic"]
+            other_nodes = [n for n in all_nodes if n.zone not in ("episodic", "semantic")]
+
+            # 每次巩固最多尝试2次创造性重组
+            insights_created = 0
+            for attempt in range(2):
+                # 2. 随机抽取5-8个节点（确保多样性）
+                sample_size = random.randint(5, 8)
+                selected_nodes = []
+
+                # 至少1个episodic
+                if episodic_nodes:
+                    selected_nodes.extend(random.sample(episodic_nodes, min(1, len(episodic_nodes))))
+
+                # 至少1个semantic
+                if semantic_nodes:
+                    selected_nodes.extend(random.sample(semantic_nodes, min(1, len(semantic_nodes))))
+
+                # 填充剩余名额（从所有节点中随机选择）
+                remaining = sample_size - len(selected_nodes)
+                if remaining > 0:
+                    available = [n for n in all_nodes if n not in selected_nodes]
+                    if available:
+                        selected_nodes.extend(random.sample(available, min(remaining, len(available))))
+
+                if len(selected_nodes) < 3:
+                    # 样本太少，跳过这次尝试
+                    continue
+
+                # 3. 构建prompt
+                fragments = "\n".join(
+                    f"- [{n.zone}] {n.name}: {n.summary or '(no summary)'}  (tags: {', '.join(n.tags[:3])})"
+                    for n in selected_nodes
+                )
+                user_prompt = f"Memory fragments:\n\n{fragments}"
+
+                # 4. 调用LLM尝试发现洞察
+                try:
+                    result = await call_llm_json(
+                        _CREATIVE_RECOMBINATION_SYSTEM,
+                        user_prompt,
+                        temperature=0.7  # 较高温度鼓励创造性
+                    )
+                except Exception as e:
+                    logger.warning("Creative recombination LLM call failed (attempt %d): %s", attempt + 1, e)
+                    continue
+
+                insight_text = result.get("insight")
+                if not insight_text or insight_text == "null":
+                    # 没有发现有意义的洞察，这是正常的
+                    logger.debug("Creative recombination attempt %d: no insight found", attempt + 1)
+                    continue
+
+                # 5. 创建洞察节点
+                reasoning = result.get("reasoning", "")
+                actionable = result.get("actionable", "")
+                source_node_names = result.get("source_nodes", [])
+
+                # 构建洞察节点的summary
+                insight_summary = f"{insight_text} | 原因: {reasoning} | 行动: {actionable}"
+
+                try:
+                    insight_node = Node(
+                        name=f"洞察: {insight_text[:50]}",  # 限制名称长度
+                        tags=["洞察", "创造性重组"],
+                        summary=insight_summary,
+                        zone="semantic",
+                        importance=6.0,  # 中等重要，等用户确认后提升
+                        confidence=0.5,  # 未经验证的洞察
+                        properties={
+                            "insight_type": "creative_recombination",
+                            "reasoning": reasoning,
+                            "actionable": actionable,
+                            "source_count": len(selected_nodes),
+                        }
+                    )
+                    created_insight = await self.graph.create_node(insight_node, tenant_id, user_id)
+
+                    # 6. 创建关系：洞察节点 -[DERIVED_FROM]-> 源节点
+                    for source_node in selected_nodes:
+                        try:
+                            relation = Relation(
+                                from_id=created_insight.id,
+                                to_id=source_node.id,
+                                type="DERIVED_FROM",
+                                description="创造性重组发现的洞察",
+                                valid_from=datetime.utcnow(),
+                                source_session="consolidator-creative-recombination",
+                            )
+                            await self.graph.create_relation(relation)
+                        except Exception as e:
+                            logger.warning("Failed to create DERIVED_FROM relation: %s", e)
+
+                    insights_created += 1
+                    log_event("consolidation_creative_insight",
+                             f"Created insight: {insight_text[:80]}",
+                             {
+                                 "insight_id": created_insight.id,
+                                 "source_count": len(selected_nodes),
+                                 "reasoning": reasoning[:100],
+                             })
+                    logger.info("Creative recombination: created insight '%s' from %d nodes",
+                               insight_text[:80], len(selected_nodes))
+
+                except Exception as e:
+                    logger.warning("Failed to create insight node: %s", e)
+                    continue
+
+            return insights_created
+
+        except Exception as e:
+            logger.error("Creative recombination failed: %s", e)
             return 0
