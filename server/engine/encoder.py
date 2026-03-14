@@ -290,9 +290,31 @@ class Encoder:
             user_id=user_id,
         )
 
+        # Also write a summary record to buffer so retriever can find it
+        # Buffer stores the rewrite (high-density), not raw details
+        file_path = result.get("file_path", "")
+        summary_for_buffer = message
+        if target_entity:
+            summary_for_buffer = f"[{target_entity}] {message} (详见: {file_path})"
+
+        buffer_unit = {
+            "id": str(__import__('uuid').uuid4()),
+            "type": "log_index",
+            "message": summary_for_buffer,
+            "category": category,
+            "target_entity": target_entity,
+            "file_path": file_path,
+            "entities": [],
+            "relations": [],
+            "session_id": session_id,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+        importance = self._compute_importance(evaluation)
+        self.buffer.write(buffer_unit, tenant_id, user_id, session_id, importance)
+
         logger.info(
-            "Encoded log entry (category=%s, target=%s, file=%s)",
-            category, target_entity, result.get("file_path")
+            "Encoded log entry (category=%s, target=%s, file=%s, buffer=yes)",
+            category, target_entity, file_path
         )
 
         return {
