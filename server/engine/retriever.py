@@ -369,6 +369,11 @@ class Retriever:
         for node in nodes:
             if not node.id or node.id in seen_ids:
                 continue
+
+            # Filter out suppressed nodes
+            if getattr(node, "status", "active") == "suppressed":
+                continue
+
             seen_ids.add(node.id)
 
             relevance = self._text_relevance(
@@ -588,9 +593,48 @@ class Retriever:
         await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _update_and_revive(self, node_id: str) -> None:
-        """Update access for a node and revive it if dormant."""
+        """Update access for a node and revive it if dormant. Also handle spaced repetition review."""
         try:
-            await self.graph.update_access(node_id)
+            # Get the node to check if it needs review
+            node = await self.graph.get_node(node_id)
+            if node:
+                props = node.properties or {}
+                needs_review = props.get("needs_review", False)
+
+                # Update access (increments access_count, updates last_accessed, strengthens retrieval)
+                await self.graph.update_access(node_id)
+
+                # If this node was marked for review, clear the flag and update review history
+                if needs_review:
+                    review_count = props.get("review_count", 0) + 1
+                    now = datetime.utcnow()
+
+                    # Calculate next review date based on spaced repetition algorithm
+                    INTERVALS = [1, 3, 7, 21]  # First 4 reviews
+                    if review_count < len(INTERVALS):
+                        interval_days = INTERVALS[review_count]
+                    else:
+                        # After 4th review, double the interval each time
+                        interval_days = INTERVALS[-1] * (2 ** (review_count - len(INTERVALS) + 1))
+
+                    next_review_date = now + timedelta(days=interval_days)
+
+                    # Update node properties
+                    updated_props = {
+                        **props,
+                        "needs_review": False,
+                        "review_count": review_count,
+                        "last_review_date": now.isoformat(),
+                        "next_review_date": next_review_date.isoformat(),
+                    }
+
+                    await self.graph.update_node(node_id, {"properties": updated_props})
+                    logger.info(
+                        "Spaced repetition: reviewed node %s (review_count=%d, next_review in %d days)",
+                        node_id[:8], review_count, interval_days
+                    )
+
+            # Revive if dormant
             revived = await self.graph.revive_if_dormant(node_id)
             if revived:
                 logger.info("Revived dormant node %s via retrieval", node_id)

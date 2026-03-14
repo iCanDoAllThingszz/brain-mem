@@ -126,6 +126,10 @@ class WorkingMemory:
         pending_reminders = await self._fetch_pending_reminders(tenant_id, user_id)
         raw["pending_reminders"] = pending_reminders
 
+        # 7. Pending reviews (spaced repetition)
+        pending_reviews = await self._fetch_pending_reviews(tenant_id, user_id)
+        raw["pending_reviews"] = pending_reviews
+
         if agent_context:
             raw["agent_context"] = agent_context
 
@@ -135,6 +139,7 @@ class WorkingMemory:
         wm = {
             "context": context_text,
             "pending_reminders": [r.get("name", str(r)) for r in pending_reminders],
+            "pending_reviews": [r.get("name", str(r)) for r in pending_reviews],
             "user_goals": [g.get("name", str(g)) for g in active_goals],
             "emotional_baseline": emotional_baseline,
             "raw": raw,
@@ -270,6 +275,28 @@ class WorkingMemory:
             logger.warning("fetch_pending_reminders failed: %s", e)
         return reminders[:10]
 
+    async def _fetch_pending_reviews(
+        self, tenant_id: str, user_id: str
+    ) -> List[Dict[str, Any]]:
+        """Fetch nodes with properties.needs_review=true (spaced repetition)."""
+        reviews = []
+        try:
+            nodes = await self.graph.find_active_nodes(tenant_id, user_id)
+            for node in nodes:
+                props = node.properties or {}
+                if props.get("needs_review"):
+                    reviews.append({
+                        "id": node.id,
+                        "name": node.name,
+                        "summary": node.summary,
+                        "importance": node.importance,
+                        "retrieval_strength": node.retrieval_strength,
+                        "review_count": props.get("review_count", 0),
+                    })
+        except Exception as e:
+            logger.warning("fetch_pending_reviews failed: %s", e)
+        return reviews[:10]
+
     @staticmethod
     def _compute_emotional_baseline(
         recent_events: List[Dict[str, Any]],
@@ -344,6 +371,11 @@ class WorkingMemory:
         if reminders:
             reminder_names = ", ".join(r.get("name", "") for r in reminders)
             parts.append(f"Pending reminders: {reminder_names}")
+
+        reviews = raw.get("pending_reviews", [])
+        if reviews:
+            review_names = ", ".join(r.get("name", "") for r in reviews)
+            parts.append(f"Memories needing review (spaced repetition): {review_names}")
 
         if not parts:
             return "No prior context available for this user."

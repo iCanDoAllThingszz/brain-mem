@@ -171,6 +171,11 @@ class Encoder:
             return await self._encode_prospective(
                 message, evaluation, tenant_id, user_id, session_id
             )
+        elif category == "forget":
+            # Forget flow: suppress nodes
+            return await self._encode_forget(
+                message, evaluation, tenant_id, user_id, session_id
+            )
         else:
             logger.warning("Unknown category '%s', defaulting to cognition", category)
             return await self._encode_cognition(
@@ -528,6 +533,89 @@ class Encoder:
             "trigger_value": trigger_value,
             "action": action,
             "status": "pending",
+            "session_id": session_id,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+
+    async def _encode_forget(
+        self,
+        message: str,
+        evaluation: Dict[str, Any],
+        tenant_id: str,
+        user_id: str,
+        session_id: str,
+    ) -> Dict[str, Any]:
+        """
+        Forget encoding flow: suppress nodes by marking them as suppressed.
+
+        Args:
+            message: Original message content
+            evaluation: Evaluation dict (contains target_entity)
+            tenant_id: Tenant ID
+            user_id: User ID
+            session_id: Session ID
+
+        Returns:
+            Dict with keys: type="forget", nodes_suppressed, target_entity
+        """
+        target_entity = evaluation.get("target_entity")
+
+        if not target_entity:
+            logger.warning("Forget missing target_entity, skipping")
+            return {"skipped": True, "reason": "missing_target_entity"}
+
+        # Step 1: Find the target node(s) by name or fuzzy match
+        nodes = await self.graph.find_nodes_by_name(target_entity, tenant_id, user_id)
+        if not nodes:
+            # Try fuzzy search
+            nodes = await self.graph.find_nodes_fuzzy(target_entity, tenant_id, user_id)
+
+        if not nodes:
+            logger.warning("Target entity '%s' not found for forgetting", target_entity)
+            return {"skipped": True, "reason": "target_entity_not_found", "target_entity": target_entity}
+
+        # Step 2: Suppress all matching nodes
+        suppressed_count = 0
+        suppressed_ids = []
+
+        for node in nodes:
+            node_id = node.id
+            try:
+                # Update node status to suppressed
+                updates = {
+                    "status": "suppressed",
+                    "retrieval_strength": 0.0,
+                    "properties": {
+                        **node.properties,
+                        "_suppressed_at": datetime.utcnow().isoformat(),
+                        "_suppressed_reason": message,
+                        "_suppressed_session": session_id,
+                    },
+                }
+                await self.graph.update_node(node_id, updates)
+                suppressed_count += 1
+                suppressed_ids.append(node_id)
+
+                logger.info(
+                    "Suppressed node %s (entity=%s) via forget command",
+                    node_id[:8], node.name
+                )
+            except Exception as e:
+                logger.warning("Failed to suppress node %s: %s", node_id, e)
+
+        if suppressed_count == 0:
+            return {"skipped": True, "reason": "suppression_failed", "target_entity": target_entity}
+
+        logger.info(
+            "Forget: suppressed %d nodes (entity=%s)",
+            suppressed_count, target_entity
+        )
+
+        return {
+            "type": "forget",
+            "target_entity": target_entity,
+            "nodes_suppressed": suppressed_count,
+            "suppressed_ids": suppressed_ids,
             "session_id": session_id,
             "timestamp": datetime.utcnow().isoformat(),
         }
