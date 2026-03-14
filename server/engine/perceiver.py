@@ -48,7 +48,7 @@ Key rules:
 ## Job 2: Rewrite (only when type = "informative")
 Rewrite the original message into a HIGH-DENSITY memory statement that:
 1. Makes the user (subject) explicit — use their name from context
-2. Extracts IMPLICIT information (interests, intentions, emotions, motivations)
+2. Records FACTS as stated — do NOT generalize single events into habits or preferences
 3. Connects to known context (goals, recent events, career plans) when relevant
 4. Strips away common knowledge noise, keeping only personal-relevant parts
 5. Makes entity relationships explicit
@@ -56,6 +56,10 @@ Rewrite the original message into a HIGH-DENSITY memory statement that:
    If the user is questioning/doubting something, keep that tone. \
    If the user is stating a fact, keep it factual. \
    When uncertain about intent, prefer a more literal rewrite over speculation.
+7. **NO OVER-INFERENCE** — A single action does NOT imply a habit or preference. \
+   "吃了一个苹果" means they ate an apple ONCE, NOT that they "have a habit of eating fruit". \
+   "跑了5公里" means they ran 5km ONCE, NOT that they "regularly exercise". \
+   Only state what is explicitly said. Pattern recognition is the consolidator's job, not yours.
 
 Examples:
 - Original: "最近ai agent有啥新动向"
@@ -76,6 +80,14 @@ Examples:
 - Original: "好的 明天开始记录饮食"
   Context: User has a weight loss plan, stalled for 4 days
   Rewrite: "赵禹承诺明天重新开始记录饮食，减肥计划即将恢复"
+
+- Original: "早上我吃了一个苹果"
+  Rewrite: "赵禹早上吃了一个苹果"
+  ❌ WRONG: "赵禹有早餐吃水果的习惯" (over-inference from single event)
+
+- Original: "我今天中午吃了一碗牛肉面 大概600大卡"
+  Rewrite: "赵禹今日午餐吃了一碗牛肉面，约600大卡"
+  ❌ WRONG: "赵禹喜欢吃牛肉面" (over-inference)
 
 - Original: "怎么会有两个服务 不是就一个服务吗"
   Context: User is debugging a memory system project
