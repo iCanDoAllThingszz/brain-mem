@@ -8,6 +8,7 @@ v2: Entity lifecycle management — tag归属 + 去重 + 关系构建 合并为�
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from datetime import datetime
@@ -23,14 +24,11 @@ from server.storage.tag_dict import TagDict
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Entity filtering constants
+# Minimal hardcoded rules (fallback only)
 # ---------------------------------------------------------------------------
-ENTITY_BLACKLIST_TAGS = {"食物", "数值", "数据", "调试"}
-ENTITY_BLACKLIST_PATTERNS = [
-    r"^\d+大卡$",      # 纯热量数值
-    r"^\d+kg$",        # 纯体重数值
-    r"^\d+公里$",      # 纯距离数值
-]
+# Pronouns that always map to the user's primary node
+PRONOUN_TO_USER = {"我", "用户", "用户本人", "本人"}
+# The primary user name will be fetched from graph or config
 
 # ---------------------------------------------------------------------------
 # Step 1: 粗提取 — 从消息中提取原始实体和关系
@@ -216,8 +214,10 @@ class Encoder:
         raw_entities = extraction.get("entities", [])
         raw_relations = extraction.get("relations", [])
 
-        # Step 1.5: Filter out low-value entities
-        raw_entities = self._filter_entities(raw_entities)
+        # Step 1.5: Smart entity resolution (LLM-driven)
+        raw_entities = await self._smart_resolve_entities(
+            raw_entities, tenant_id, user_id, message
+        )
 
         if not raw_entities:
             logger.info("No entities extracted, skipping encode")
@@ -823,42 +823,154 @@ Return ONLY valid JSON:
     # Entity filtering
     # ------------------------------------------------------------------
 
-    def _filter_entities(self, entities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    async def _smart_resolve_entities(
+        self,
+        raw_entities: List[Dict[str, Any]],
+        tenant_id: str,
+        user_id: str,
+        message_context: str,
+    ) -> List[Dict[str, Any]]:
         """
-        Filter out low-value entities that shouldn't enter the graph.
+        LLM-driven intelligent entity resolution.
+
+        For each candidate entity, the LLM decides:
+        - create: New entity, not in graph
+        - merge: Same as existing entity, merge to existing node
+        - update: New info for existing entity, update existing node
+        - skip: Not worth adding to graph (trivial details, numbers, food, etc.)
 
         Args:
-            entities: List of extracted entities
+            raw_entities: Coarsely extracted candidate entities
+            tenant_id: Tenant ID
+            user_id: User ID
+            message_context: Original user message for context
 
         Returns:
-            Filtered list of entities
+            List of entities with resolution decisions attached
         """
-        import re
+        if not raw_entities:
+            return []
 
-        filtered = []
-        for entity in entities:
-            tags = set(entity.get("tags", []))
+        # Step 1: For each candidate, find related existing entities in graph
+        existing_entities_map = {}
+        for entity in raw_entities:
             name = entity.get("name", "")
+            tags = entity.get("tags", [])
 
-            # Skip blacklisted tags
-            if tags & ENTITY_BLACKLIST_TAGS:
-                logger.debug("Filtered entity '%s' due to blacklisted tag: %s", name, tags & ENTITY_BLACKLIST_TAGS)
-                continue
+            # Search by name
+            by_name = await self.graph.find_nodes_by_name(name, tenant_id, user_id)
+            # Search by fuzzy match
+            by_fuzzy = await self.graph.find_nodes_fuzzy(name, tenant_id, user_id)
+            # Search by tags
+            by_tags = []
+            if tags:
+                by_tags = await self.graph.find_nodes_by_tags(tags, tenant_id, user_id)
 
-            # Skip pure numeric patterns
-            skip = False
-            for pattern in ENTITY_BLACKLIST_PATTERNS:
-                if re.match(pattern, name):
-                    logger.debug("Filtered entity '%s' due to pattern match: %s", name, pattern)
-                    skip = True
-                    break
+            # Combine and deduplicate (limit to top 5 most relevant)
+            seen_ids = set()
+            related = []
+            for node in by_name + by_fuzzy + by_tags:
+                if node.id not in seen_ids and node.status == "active":
+                    seen_ids.add(node.id)
+                    related.append(node)
+                    if len(related) >= 5:
+                        break
 
-            if skip:
-                continue
+            existing_entities_map[name] = related
 
-            filtered.append(entity)
+        # Step 2: Build LLM prompt
+        candidates_json = []
+        for entity in raw_entities:
+            candidates_json.append({
+                "name": entity.get("name", ""),
+                "tags": entity.get("tags", []),
+                "summary": entity.get("summary", ""),
+            })
 
-        return filtered
+        existing_json = {}
+        for name, nodes in existing_entities_map.items():
+            existing_json[name] = [
+                {
+                    "name": node.name,
+                    "tags": node.tags,
+                    "summary": node.summary or "",
+                    "aliases": node.aliases,
+                }
+                for node in nodes
+            ]
+
+        system_prompt = """\
+You are a knowledge graph entity management expert. The user's message produced candidate entities. \
+For each candidate, decide how to handle it.
+
+Return ONLY valid JSON array:
+[
+  {
+    "name": "entity name",
+    "decision": "create|merge|update|skip",
+    "target": "target entity name (for merge/update) or null",
+    "reason": "brief reason"
+  }
+]
+
+Decisions:
+1. "create" — New, valuable entity not in graph
+2. "merge" — Same as existing entity (including pronouns like "我/用户" referring to user)
+   - Specify merge_target (existing entity name)
+3. "update" — New information for existing entity
+   - Specify update_target (existing entity name)
+4. "skip" — Not worth adding to graph:
+   - Pure numbers ("600大卡", "90kg", "5公里")
+   - Specific food items ("苹果", "牛肉面") — these belong in diet logs
+   - Universal concepts (LLM already knows, like "地球", "太阳")
+   - Debug/test temporary info
+   - Pronouns ("我", "用户") if user node already exists
+
+Principles:
+- Prefer skip over creating low-value nodes
+- Prefer merge over creating duplicate nodes
+- People, organizations, projects, plans, decisions, milestones → usually create or update
+- Food, numbers, universal concepts → usually skip
+- When uncertain → skip (prevent graph bloat)
+"""
+
+        user_prompt = f"""\
+User message context: "{message_context}"
+
+Candidate entities:
+{json.dumps(candidates_json, ensure_ascii=False, indent=2)}
+
+Related existing entities in graph:
+{json.dumps(existing_json, ensure_ascii=False, indent=2)}
+"""
+
+        # Step 3: Call LLM
+        try:
+            result = await call_llm_json(system_prompt, user_prompt, temperature=0.2)
+            decisions = result if isinstance(result, list) else result.get("decisions", [])
+        except Exception as e:
+            logger.error("LLM entity resolution failed: %s. Defaulting to skip all.", e)
+            # Fallback: skip all entities on error (防误杀)
+            decisions = [
+                {"name": e.get("name", ""), "decision": "skip", "target": None, "reason": "LLM error"}
+                for e in raw_entities
+            ]
+
+        # Step 4: Attach decisions to entities
+        decision_map = {d.get("name", ""): d for d in decisions}
+        resolved = []
+        for entity in raw_entities:
+            name = entity.get("name", "")
+            decision = decision_map.get(name, {"decision": "skip", "target": None, "reason": "no decision"})
+            entity["resolution"] = decision
+
+            # Only keep entities that are not skipped
+            if decision.get("decision") != "skip":
+                resolved.append(entity)
+            else:
+                logger.debug("Skipped entity '%s': %s", name, decision.get("reason", ""))
+
+        return resolved
 
     async def _strict_dedup_check(self, entity_name: str, tenant_id: str, user_id: str) -> Optional[Node]:
         """
