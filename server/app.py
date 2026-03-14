@@ -239,8 +239,9 @@ async def _process_after_response(
             memory_input = rewrite or user_message
             category = perception.get("category", "cognition")
 
-            # Log-type messages bypass evaluator — logs are always worth recording
-            if category.startswith("log_"):
+            # Log-type and reconsolidation messages bypass evaluator
+            # Logs are always worth recording, reconsolidations are user-initiated corrections
+            if category.startswith("log_") or category == "reconsolidation":
                 evaluation = {
                     "task_relevance": 5,
                     "emotional_intensity": 0,
@@ -248,13 +249,14 @@ async def _process_after_response(
                     "novelty": 5,
                     "encode_decision": True,
                     "encode_priority": "low",
-                    "reason": f"log-type message ({category}), auto-encode",
+                    "reason": f"{category} message, auto-encode",
                     "category": category,
                     "target_entity": perception.get("target_entity"),
+                    "correction_type": perception.get("correction_type"),
                 }
                 log_event("evaluator", f"[auto-pass] category={category}", {
                     "encode_decision": True,
-                    "reason": f"log-type auto-encode ({category})",
+                    "reason": f"{category} auto-encode",
                 })
             else:
                 evaluation = await evaluator.evaluate(memory_input, wm)
@@ -265,9 +267,10 @@ async def _process_after_response(
                 })
 
             if evaluation.get("encode_decision"):
-                # Pass category and target_entity to encoder
+                # Pass category, target_entity, and correction_type to encoder
                 evaluation["category"] = perception.get("category", "cognition")
                 evaluation["target_entity"] = perception.get("target_entity")
+                evaluation["correction_type"] = perception.get("correction_type")
 
                 # Encode the rewrite (higher density) but store original message too
                 result = await encoder.encode_message(
