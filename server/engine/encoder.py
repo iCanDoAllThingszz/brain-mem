@@ -23,6 +23,16 @@ from server.storage.tag_dict import TagDict
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Entity filtering constants
+# ---------------------------------------------------------------------------
+ENTITY_BLACKLIST_TAGS = {"食物", "数值", "数据", "调试"}
+ENTITY_BLACKLIST_PATTERNS = [
+    r"^\d+大卡$",      # 纯热量数值
+    r"^\d+kg$",        # 纯体重数值
+    r"^\d+公里$",      # 纯距离数值
+]
+
+# ---------------------------------------------------------------------------
 # Step 1: 粗提取 — 从消息中提取原始实体和关系
 # ---------------------------------------------------------------------------
 _EXTRACT_SYSTEM = """\
@@ -37,6 +47,8 @@ Rules:
 - **PRONOUN RESOLUTION**: Replace pronouns like "我", "用户", "本人" with the user's actual name \
   from context (e.g., "赵禹"). Never create an entity named "用户" or "我" — always resolve to \
   the real person. If the user's name is unknown, use "用户本人" as a placeholder.
+- **CRITICAL USER ALIAS RULE**: The following words ALL refer to the same person "赵禹": \
+  我, 用户, 用户本人, 本人, 禹哥. NEVER create separate entities for these. ALWAYS use "赵禹".
 - Assign a memory zone: semantic / episodic / procedural / emotional.
 - Assign 1-2 preliminary tags per entity (Chinese labels preferred).
 - Ignore garbled/encoded names (like "Gbusrw Jflvnkmwi") — display artifacts.
@@ -203,6 +215,9 @@ class Encoder:
         extraction = await self._extract_raw(message, working_memory)
         raw_entities = extraction.get("entities", [])
         raw_relations = extraction.get("relations", [])
+
+        # Step 1.5: Filter out low-value entities
+        raw_entities = self._filter_entities(raw_entities)
 
         if not raw_entities:
             logger.info("No entities extracted, skipping encode")
@@ -805,6 +820,94 @@ Return ONLY valid JSON:
             return False  # Fail-open: allow encoding if LLM fails
 
     # ------------------------------------------------------------------
+    # Entity filtering
+    # ------------------------------------------------------------------
+
+    def _filter_entities(self, entities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Filter out low-value entities that shouldn't enter the graph.
+
+        Args:
+            entities: List of extracted entities
+
+        Returns:
+            Filtered list of entities
+        """
+        import re
+
+        filtered = []
+        for entity in entities:
+            tags = set(entity.get("tags", []))
+            name = entity.get("name", "")
+
+            # Skip blacklisted tags
+            if tags & ENTITY_BLACKLIST_TAGS:
+                logger.debug("Filtered entity '%s' due to blacklisted tag: %s", name, tags & ENTITY_BLACKLIST_TAGS)
+                continue
+
+            # Skip pure numeric patterns
+            skip = False
+            for pattern in ENTITY_BLACKLIST_PATTERNS:
+                if re.match(pattern, name):
+                    logger.debug("Filtered entity '%s' due to pattern match: %s", name, pattern)
+                    skip = True
+                    break
+
+            if skip:
+                continue
+
+            filtered.append(entity)
+
+        return filtered
+
+    async def _strict_dedup_check(self, entity_name: str, tenant_id: str, user_id: str) -> Optional[Node]:
+        """
+        Strict deduplication check before writing to buffer.
+
+        Checks:
+        1. Exact name match
+        2. Alias match
+        3. Substring match (e.g., "海马体缓冲区" contains "海马体")
+
+        Args:
+            entity_name: Entity name to check
+            tenant_id: Tenant ID
+            user_id: User ID
+
+        Returns:
+            Existing node if found, None otherwise
+        """
+        try:
+            # 1. Exact name match
+            matches = await self.graph.find_nodes_by_name(entity_name, tenant_id, user_id)
+            if matches:
+                return matches[0]
+
+            # 2. Alias match
+            matches = await self.graph.find_nodes_by_alias(entity_name, tenant_id, user_id)
+            if matches:
+                return matches[0]
+
+            # 3. Substring match (check if entity_name is contained in any existing node name)
+            all_nodes = await self.graph.find_active_nodes(tenant_id, user_id)
+            entity_lower = entity_name.lower()
+
+            for node in all_nodes:
+                node_lower = node.name.lower()
+                # Check if one is substring of the other
+                if entity_lower in node_lower or node_lower in entity_lower:
+                    # Only match if similarity is high enough
+                    if len(entity_lower) >= 2 and len(node_lower) >= 2:
+                        logger.debug("Substring match found: '%s' <-> '%s'", entity_name, node.name)
+                        return node
+
+            return None
+
+        except Exception as e:
+            logger.warning("Strict dedup check failed for '%s': %s", entity_name, e)
+            return None
+
+    # ------------------------------------------------------------------
     # Step 1: Coarse extraction
     # ------------------------------------------------------------------
 
@@ -837,13 +940,31 @@ Return ONLY valid JSON:
     ) -> Dict[str, Any]:
         """
         对单个实体执行完整的解析流程：
-        1. Tag归属：查tag字典，确定实体应归入哪个tag
-        2. 同类检索：按tag去图谱检索同类实体
-        3. LLM判断：create/merge/update + 关系构建（一次调用）
-        4. 干扰检测：检查是否存在高度相似的旧实体，标记冲突或更新关系
+        1. 严格去重检查（新增）
+        2. Tag归属：查tag字典，确定实体应归入哪个tag
+        3. 同类检索：按tag去图谱检索同类实体
+        4. LLM判断：create/merge/update + 关系构建（一次调用）
+        5. 干扰检测：检查是否存在高度相似的旧实体，标记冲突或更新关系
         """
         name = raw_entity.get("name", "").strip()
         raw_tags = raw_entity.get("tags", [])
+
+        # --- Step 1: 严格去重检查 ---
+        existing_node = await self._strict_dedup_check(name, tenant_id, user_id)
+        if existing_node:
+            logger.info("Strict dedup: entity '%s' already exists as '%s' (%s), will update",
+                       name, existing_node.name, existing_node.id[:8])
+            return {
+                "action": "update",
+                "final_name": existing_node.name,
+                "resolved_tags": existing_node.tags,
+                "existing_id": existing_node.id,
+                "aliases_to_add": [name] if name != existing_node.name else [],
+                "summary_update": raw_entity.get("summary"),
+                "properties_update": {},
+                "new_relations": [],
+                "reason": "strict dedup match",
+            }
 
         # --- Step 2: Tag归属 ---
         resolved_tags = []
