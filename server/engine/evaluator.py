@@ -38,13 +38,16 @@ Scoring anchors:
    emotion_type must be one of: joy, sadness, anger, fear, surprise, neutral
 
 3. novelty (0-10):
-   0-2: Already well-known information, repeated fact, OR information already stored in memory
+   0-2: Already well-known information, repeated fact, OR information already stored in memory, \
+        OR temporary debugging/troubleshooting questions about transient technical issues
    3-4: Minor new detail about a known topic
    5-6: Meaningful new information
    7-8: Surprising new fact or unexpected development
    9-10: Completely unexpected, paradigm-shifting information
    NOTE: If the user's context shows this information is already known \
-   (e.g., "user works at Meituan" is already in context), score novelty LOW (0-2).
+   (e.g., "user works at Meituan" is already in context), score novelty LOW (0-2). \
+   Debugging queries about temporary issues (e.g., "why are there two services") \
+   should also score LOW (0-2) as they are transient, not long-term memorable facts.
 
 Encoding decision rules (apply in order):
 - If task_relevance >= 7 → encode_decision = true, encode_priority = "high"

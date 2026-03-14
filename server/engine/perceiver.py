@@ -29,8 +29,9 @@ Categorize the message into one of three types:
   * Universal common knowledge: "地球是圆的", "天是蓝的", "水是H2O"
   * Generic weather/time remarks with no personal context
 
-- "command": A pure instruction with NO personal information embedded.
-  Examples: "翻译这段话", "查一下天气"
+- "command": A pure instruction with NO personal information embedded. \
+  This includes debugging/troubleshooting queries about temporary technical issues. \
+  Examples: "翻译这段话", "查一下天气", "检查一下日志", "为什么会有两个服务"
 
 - "informative": Contains information worth remembering about this user. \
   This includes EXPLICIT info (facts, decisions, plans) AND IMPLICIT info \
@@ -51,6 +52,10 @@ Rewrite the original message into a HIGH-DENSITY memory statement that:
 3. Connects to known context (goals, recent events, career plans) when relevant
 4. Strips away common knowledge noise, keeping only personal-relevant parts
 5. Makes entity relationships explicit
+6. **PRESERVE ORIGINAL INTENT** — Do NOT over-infer or change the semantic meaning. \
+   If the user is questioning/doubting something, keep that tone. \
+   If the user is stating a fact, keep it factual. \
+   When uncertain about intent, prefer a more literal rewrite over speculation.
 
 Examples:
 - Original: "最近ai agent有啥新动向"
@@ -71,6 +76,10 @@ Examples:
 - Original: "好的 明天开始记录饮食"
   Context: User has a weight loss plan, stalled for 4 days
   Rewrite: "赵禹承诺明天重新开始记录饮食，减肥计划即将恢复"
+
+- Original: "怎么会有两个服务 不是就一个服务吗"
+  Context: User is debugging a memory system project
+  Rewrite: "赵禹对系统中存在两个服务表示疑惑，认为应该只有一个服务"
 
 For "noise" or "command" types, rewrite should be null.
 
