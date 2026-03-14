@@ -396,6 +396,23 @@ class Retriever:
 
         return _NodeProxy(props)
 
+    @staticmethod
+    def _node_from_dict(node_data: Dict[str, Any]) -> Any:
+        """Create a lightweight dict-like object from a Neo4j node dict (e.g., from vector search)."""
+        class _NodeProxy:
+            def __init__(self, p: dict) -> None:
+                self.id = p.get("id", "")
+                self.name = p.get("name", "")
+                self.summary = p.get("summary", "")
+                self.importance = float(p.get("importance", 5.0))
+                self.retrieval_strength = float(p.get("retrieval_strength", 5.0))
+                self.access_count = int(p.get("access_count", 0))
+                self.last_accessed = p.get("last_accessed", "")
+                self.emotional_tag = p.get("emotional_tag", {"type": "neutral", "intensity": 0})
+                self.confidence = float(p.get("confidence", 1.0))
+                self.content = p.get("content", "")
+        return _NodeProxy(node_data)
+
     def _score_candidates(
         self,
         nodes: list,
