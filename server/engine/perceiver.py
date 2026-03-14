@@ -98,9 +98,23 @@ For "noise" or "command" types, rewrite should be null.
 Return ONLY valid JSON:
 {
   "type": "noise" | "command" | "informative",
+  "category": "cognition" | "log_diet" | "log_exercise" | "log_interview" | "log_trading" | "log_learning" | "log_general",
+  "target_entity": "entity name that should be updated (e.g., '减肥计划', '跳槽计划')" | null,
   "reason": "one-sentence classification explanation",
   "rewrite": "rewritten high-density memory statement" | null
 }
+
+Category rules:
+- "cognition": Information that directly affects user profile, goals, decisions, relationships, or milestones
+- "log_diet": Diet/food records (should update a weight loss or health plan entity)
+- "log_exercise": Exercise/workout records (should update a fitness plan entity)
+- "log_interview": Interview feedback or progress (should update a job search plan entity)
+- "log_trading": Trading records or market observations (should update a trading plan entity)
+- "log_learning": Learning notes or study records (should update a learning plan entity)
+- "log_general": Other log-type information that doesn't fit above categories
+
+For log categories, identify the target_entity that should be updated (e.g., "减肥计划", "跳槽计划").
+For cognition category or noise/command types, target_entity should be null.
 """
 
 
@@ -123,6 +137,8 @@ class Perceiver:
         Returns:
             Dict with keys:
                 - "type": "noise" | "command" | "informative"
+                - "category": "cognition" | "log_*" — information category
+                - "target_entity": str | None — entity to update for log categories
                 - "reason": str
                 - "rewrite": str | None — high-density rewrite for informative messages
         """
@@ -141,14 +157,36 @@ class Perceiver:
             elif rewrite and len(rewrite.strip()) < 5:
                 rewrite = None
 
+            # Extract category and target_entity
+            category = result.get("category", "cognition")
+            valid_categories = {
+                "cognition", "log_diet", "log_exercise", "log_interview",
+                "log_trading", "log_learning", "log_general"
+            }
+            if category not in valid_categories:
+                logger.warning("Unexpected category '%s', defaulting to cognition", category)
+                category = "cognition"
+
+            target_entity = result.get("target_entity")
+            if msg_type != "informative" or category == "cognition":
+                target_entity = None
+
             return {
                 "type": msg_type,
+                "category": category,
+                "target_entity": target_entity,
                 "reason": result.get("reason", ""),
                 "rewrite": rewrite,
             }
         except Exception as e:
             logger.error("Perceiver.classify failed: %s", e)
-            return {"type": "informative", "reason": f"classification error: {e}", "rewrite": None}
+            return {
+                "type": "informative",
+                "category": "cognition",
+                "target_entity": None,
+                "reason": f"classification error: {e}",
+                "rewrite": None
+            }
 
     # ------------------------------------------------------------------
     # Internal helpers

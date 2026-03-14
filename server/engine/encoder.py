@@ -14,6 +14,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from server.engine.llm_client import call_llm, call_llm_json
+from server.engine.log_writer import LogWriter
 from server.models.node import Node
 from server.storage.buffer import EncoderBuffer
 from server.storage.graph import GraphStore
@@ -122,12 +123,17 @@ class Encoder:
     3. 按tag去图谱检索同类实体
     4. LLM一次性判断：create/merge/update + 关系构建
     5. 去重检查 → 写入buffer
+
+    v3 flow:
+    - If category = "cognition": use v2 flow (write to graph)
+    - If category = "log_*": write to file + update graph index
     """
 
     def __init__(self, graph: GraphStore, tag_dict: TagDict, buffer: EncoderBuffer) -> None:
         self.graph = graph
         self.tag_dict = tag_dict
         self.buffer = buffer
+        self.log_writer = LogWriter(graph)
 
     async def encode_message(
         self,
@@ -138,7 +144,39 @@ class Encoder:
         session_id: str,
         working_memory: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Encode a message into a structured memory unit."""
+        """
+        Encode a message into a structured memory unit.
+
+        v3: Routes to cognition encoding or log encoding based on category.
+        """
+        category = evaluation.get("category", "cognition")
+
+        if category == "cognition":
+            # Original flow: extract entities → write to graph buffer
+            return await self._encode_cognition(
+                message, evaluation, tenant_id, user_id, session_id, working_memory
+            )
+        elif category.startswith("log_"):
+            # New flow: write to file + update graph index
+            return await self._encode_log(
+                message, evaluation, category, tenant_id, user_id, session_id
+            )
+        else:
+            logger.warning("Unknown category '%s', defaulting to cognition", category)
+            return await self._encode_cognition(
+                message, evaluation, tenant_id, user_id, session_id, working_memory
+            )
+
+    async def _encode_cognition(
+        self,
+        message: str,
+        evaluation: Dict[str, Any],
+        tenant_id: str,
+        user_id: str,
+        session_id: str,
+        working_memory: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Original cognition encoding flow (v2)."""
 
         # Step 0: Semantic dedup check against recent buffer (hybrid approach)
         recent = self.buffer.read_recent(tenant_id, user_id, limit=20)
@@ -217,6 +255,56 @@ class Encoder:
             len(all_new_relations),
         )
         return memory_unit
+
+    async def _encode_log(
+        self,
+        message: str,
+        evaluation: Dict[str, Any],
+        category: str,
+        tenant_id: str,
+        user_id: str,
+        session_id: str,
+    ) -> Dict[str, Any]:
+        """
+        Log encoding flow (v3): write to file + update graph index.
+
+        Args:
+            message: Log message content
+            evaluation: Evaluation dict (contains category, target_entity)
+            category: Log category (log_diet, log_exercise, etc.)
+            tenant_id: Tenant ID
+            user_id: User ID
+            session_id: Session ID
+
+        Returns:
+            Dict with keys: type="log", file_path, log_date, target_entity_updated
+        """
+        target_entity = evaluation.get("target_entity")
+
+        # Write log to file and update graph
+        result = await self.log_writer.write_log(
+            category=category,
+            message=message,
+            target_entity=target_entity,
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+
+        logger.info(
+            "Encoded log entry (category=%s, target=%s, file=%s)",
+            category, target_entity, result.get("file_path")
+        )
+
+        return {
+            "type": "log",
+            "category": category,
+            "target_entity": target_entity,
+            "file_path": result.get("file_path"),
+            "log_date": result.get("log_date"),
+            "target_entity_updated": result.get("target_entity_updated"),
+            "session_id": session_id,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
 
     async def generate_session_summary(
         self,

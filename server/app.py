@@ -228,6 +228,8 @@ async def _process_after_response(
 
         log_event("perceiver", f"[{msg_type}] {user_message[:60]}", {
             "type": msg_type,
+            "category": perception.get("category", "cognition"),
+            "target_entity": perception.get("target_entity"),
             "reason": perception.get("reason", ""),
             "rewrite": rewrite[:100] if rewrite else None,
         })
@@ -244,6 +246,10 @@ async def _process_after_response(
             })
 
             if evaluation.get("encode_decision"):
+                # Pass category and target_entity to encoder
+                evaluation["category"] = perception.get("category", "cognition")
+                evaluation["target_entity"] = perception.get("target_entity")
+
                 # Encode the rewrite (higher density) but store original message too
                 result = await encoder.encode_message(
                     memory_input, evaluation, tenant_id, user_id, session_id, wm
