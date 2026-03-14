@@ -58,9 +58,17 @@ You are a knowledge graph entity resolver. Given a newly extracted entity and \
 the existing entities in the graph that share similar tags, decide what to do.
 
 You must decide ONE of three actions:
-1. "merge" — The new entity is the same as an existing entity. Merge into it.
-2. "update" — The new entity adds new information to an existing entity. Update it.
-3. "create" — The new entity is genuinely new. Create it.
+1. "merge" — The new entity is the SAME entity as an existing one (same person/org/concept). \
+   Use this when the new entity is just another mention or alias of an existing entity. \
+   Example: "腾讯" and "Tencent" are the same company → merge.
+2. "update" — The new entity adds NEW information to an existing entity. \
+   Use this when the entity already exists but the new mention provides additional details. \
+   Example: existing "赵禹" has no job info, new mention says "赵禹在美团工作" → update.
+3. "create" — The new entity is genuinely NEW and distinct from all existing entities. \
+   Only use this if you're confident it's a different entity.
+
+**IMPORTANT**: Be conservative with "create". If there's ANY chance the entity already exists, \
+prefer "merge" or "update". Duplicate entities are worse than merged entities.
 
 Tag assignment rules:
 - Use the provided tag taxonomy. Pick the best matching tag(s).
@@ -129,12 +137,11 @@ class Encoder:
     ) -> Dict[str, Any]:
         """Encode a message into a structured memory unit."""
 
-        # Step 0: Dedup check against recent buffer
+        # Step 0: Semantic dedup check against recent buffer (hybrid approach)
         recent = self.buffer.read_recent(tenant_id, user_id, limit=20)
-        for existing in recent:
-            if existing.get("message", "").strip() == message.strip():
-                logger.info("Skipping duplicate message: %.60s", message)
-                return {"skipped": True, "reason": "duplicate"}
+        if await self._is_semantic_duplicate(message, recent):
+            logger.info("Skipping semantically duplicate message: %.60s", message)
+            return {"skipped": True, "reason": "semantic_duplicate"}
 
         # Step 1: Coarse extraction — get raw entities and relations
         extraction = await self._extract_raw(message, working_memory)
@@ -253,6 +260,100 @@ class Encoder:
         return summary_unit
 
     # ------------------------------------------------------------------
+    # Step 0: Semantic deduplication
+    # ------------------------------------------------------------------
+
+    async def _is_semantic_duplicate(
+        self,
+        message: str,
+        recent_units: List[Dict[str, Any]],
+    ) -> bool:
+        """
+        Hybrid semantic deduplication:
+        1. Quick keyword overlap filter (70%+ overlap → likely duplicate)
+        2. For borderline cases (40-70%), use LLM to judge
+        """
+        if not recent_units:
+            return False
+
+        msg_words = set(self._tokenize_chinese(message))
+        if len(msg_words) < 3:
+            # Too short to meaningfully compare
+            return False
+
+        borderline_candidates = []
+
+        for unit in recent_units:
+            existing_msg = unit.get("message", "").strip()
+            if not existing_msg:
+                continue
+
+            # Exact match
+            if existing_msg == message:
+                return True
+
+            existing_words = set(self._tokenize_chinese(existing_msg))
+            if len(existing_words) < 3:
+                continue
+
+            # Keyword overlap ratio
+            overlap = len(msg_words & existing_words)
+            union = len(msg_words | existing_words)
+            ratio = overlap / union if union > 0 else 0
+
+            if ratio >= 0.7:
+                # High overlap → definitely duplicate
+                logger.debug("High keyword overlap (%.2f) with existing message", ratio)
+                return True
+            elif 0.4 <= ratio < 0.7:
+                # Borderline → need LLM check
+                borderline_candidates.append(existing_msg)
+
+        # LLM check for borderline cases
+        if borderline_candidates:
+            return await self._llm_similarity_check(message, borderline_candidates[:3])
+
+        return False
+
+    @staticmethod
+    def _tokenize_chinese(text: str) -> List[str]:
+        """Simple Chinese tokenization: split by whitespace + punctuation, keep CJK chars."""
+        import re
+        # Remove punctuation, split by whitespace
+        tokens = re.findall(r'[\w]+', text.lower())
+        return [t for t in tokens if len(t) > 1]  # Filter single chars
+
+    async def _llm_similarity_check(
+        self,
+        new_message: str,
+        existing_messages: List[str],
+    ) -> bool:
+        """Use LLM to judge if new_message is semantically duplicate of any existing message."""
+        existing_list = "\n".join(f"{i+1}. {msg}" for i, msg in enumerate(existing_messages))
+        system_prompt = """\
+You are a semantic similarity judge. Determine if the new message is semantically \
+duplicate (same core meaning) as any of the existing messages.
+
+Return ONLY valid JSON:
+{
+  "is_duplicate": true|false,
+  "reason": "one-sentence explanation"
+}
+"""
+        user_prompt = (
+            f"New message:\n\"{new_message}\"\n\n"
+            f"Existing messages:\n{existing_list}\n\n"
+            f"Is the new message a semantic duplicate of any existing message?"
+        )
+
+        try:
+            result = await call_llm_json(system_prompt, user_prompt, temperature=0.1)
+            return bool(result.get("is_duplicate", False))
+        except Exception as e:
+            logger.warning("LLM similarity check failed: %s", e)
+            return False  # Fail-open: allow encoding if LLM fails
+
+    # ------------------------------------------------------------------
     # Step 1: Coarse extraction
     # ------------------------------------------------------------------
 
@@ -311,13 +412,24 @@ class Encoder:
                 resolved_tags.append(new_tag.name)
                 self.tag_dict.increment_usage(new_tag.name)
 
-        # --- Step 3: 按tag检索同类实体 ---
+        # --- Step 3: 按tag检索同类实体 + 按名称模糊匹配 ---
         same_tag_entities = []
         try:
             all_nodes = await self.graph.find_active_nodes(tenant_id, user_id)
             for node in all_nodes:
                 node_tags = set(node.tags or [])
-                if node_tags & set(resolved_tags):  # 有交集
+                node_name_lower = node.name.lower()
+                name_lower = name.lower()
+
+                # Match by tag overlap OR name similarity
+                has_tag_overlap = bool(node_tags & set(resolved_tags))
+                has_name_similarity = (
+                    name_lower in node_name_lower or
+                    node_name_lower in name_lower or
+                    name_lower == node_name_lower
+                )
+
+                if has_tag_overlap or has_name_similarity:
                     same_tag_entities.append({
                         "name": node.name,
                         "tags": node.tags,
