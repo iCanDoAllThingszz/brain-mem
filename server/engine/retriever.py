@@ -161,23 +161,33 @@ class Retriever:
 
         # Steps 3-6: Multi-path graph retrieval (run in parallel where possible)
         node_candidates: Dict[str, Any] = {}  # node_id → scored candidate
+        fuzzy_matches: Dict[str, str] = {}  # node_id → fuzzy_query_term (for alias learning)
 
         graph_tasks = []
+        task_metadata = []  # Track which search method and term for each task
+
         for entity in entities:
             graph_tasks.append(self._search_by_name(entity, tenant_id, user_id))
+            task_metadata.append(("name", entity))
             graph_tasks.append(self._search_by_alias(entity, tenant_id, user_id))
+            task_metadata.append(("alias", entity))
         for kw in keywords:
             graph_tasks.append(self._search_fuzzy(kw, tenant_id, user_id))
+            task_metadata.append(("fuzzy", kw))
 
         if graph_tasks:
             results = await asyncio.gather(*graph_tasks, return_exceptions=True)
-            for result in results:
+            for idx, result in enumerate(results):
                 if isinstance(result, Exception):
                     logger.warning("Graph search path failed: %s", result)
                     continue
+                search_method, search_term = task_metadata[idx]
                 for node in result:
                     if node.id not in node_candidates:
                         node_candidates[node.id] = node
+                        # Track fuzzy matches for alias learning
+                        if search_method == "fuzzy":
+                            fuzzy_matches[node.id] = search_term
 
         # Search dormant nodes too (for revival)
         all_search_terms = entities + keywords
@@ -244,7 +254,7 @@ class Retriever:
         node_ids_to_update = [
             c["id"] for c in top_k if c.get("source") == "graph"
         ]
-        await self._update_access_batch(node_ids_to_update)
+        await self._update_access_batch(node_ids_to_update, fuzzy_matches)
 
         memories = [
             {
@@ -584,16 +594,17 @@ class Retriever:
             logger.error("Context reconstruction failed: %s", e)
             return "\n".join(c["content"] for c in candidates)
 
-    async def _update_access_batch(self, node_ids: List[str]) -> None:
+    async def _update_access_batch(self, node_ids: List[str], fuzzy_matches: Dict[str, str]) -> None:
         """Update access records and revive dormant nodes if retrieved."""
         tasks = []
         for nid in node_ids:
             if nid:
-                tasks.append(self._update_and_revive(nid))
+                fuzzy_term = fuzzy_matches.get(nid)
+                tasks.append(self._update_and_revive(nid, fuzzy_term))
         await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _update_and_revive(self, node_id: str) -> None:
-        """Update access for a node and revive it if dormant. Also handle spaced repetition review."""
+    async def _update_and_revive(self, node_id: str, fuzzy_term: Optional[str] = None) -> None:
+        """Update access for a node and revive it if dormant. Also handle spaced repetition review and alias learning."""
         try:
             # Get the node to check if it needs review
             node = await self.graph.get_node(node_id)
@@ -603,6 +614,26 @@ class Retriever:
 
                 # Update access (increments access_count, updates last_accessed, strengthens retrieval)
                 await self.graph.update_access(node_id)
+
+                # Alias learning: if found via fuzzy match, add the query term as an alias
+                if fuzzy_term:
+                    existing_aliases = props.get("aliases", [])
+                    node_name_lower = node.name.lower()
+                    fuzzy_term_lower = fuzzy_term.lower()
+
+                    # Only add if:
+                    # 1. Not already in aliases
+                    # 2. Not the same as node name
+                    # 3. Term is meaningful (length >= 2)
+                    if (fuzzy_term not in existing_aliases and
+                        fuzzy_term_lower != node_name_lower and
+                        len(fuzzy_term) >= 2):
+                        new_aliases = existing_aliases + [fuzzy_term]
+                        await self.graph.update_node(node_id, {"properties": {**props, "aliases": new_aliases}})
+                        logger.info(
+                            "Alias learning: added '%s' to node %s (name=%s)",
+                            fuzzy_term, node_id[:8], node.name
+                        )
 
                 # If this node was marked for review, clear the flag and update review history
                 if needs_review:
