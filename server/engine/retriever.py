@@ -224,6 +224,12 @@ class Retriever:
 
         if not scored:
             logger.info("No candidates passed minimum score threshold for query: %s", query)
+            # Try fallback retrieval with relaxed constraints
+            scored = await self._retrieve_with_fallback(
+                query, entities, keywords, current_emotion, tenant_id, user_id, max_results
+            )
+
+        if not scored:
             result = {"context": "No relevant memories found.", "memories": []}
             if session_id:
                 self._query_cache[cache_key] = (result, datetime.utcnow())
@@ -590,3 +596,133 @@ class Retriever:
                 logger.info("Revived dormant node %s via retrieval", node_id)
         except Exception as e:
             logger.warning("update_access/revive('%s') failed: %s", node_id, e)
+
+    # ------------------------------------------------------------------
+    # Retrieval fallback mechanism
+    # ------------------------------------------------------------------
+
+    async def _retrieve_with_fallback(
+        self,
+        query: str,
+        entities: List[str],
+        keywords: List[str],
+        current_emotion: str,
+        tenant_id: str,
+        user_id: str,
+        max_results: int,
+    ) -> List[Dict[str, Any]]:
+        """
+        补偿检索策略：当正常检索失败时，尝试更宽松的检索条件。
+
+        策略（按顺序尝试）：
+        1. 降低score阈值（从0.25降到0.15）
+        2. 扩大图遍历深度（从2跳到3跳）
+        3. 放宽关键词匹配（使用更短的子串）
+
+        Args:
+            query: 查询字符串
+            entities: 提取的实体列表
+            keywords: 提取的关键词列表
+            current_emotion: 当前情绪
+            tenant_id: 租户ID
+            user_id: 用户ID
+            max_results: 最大结果数
+
+        Returns:
+            补偿检索的候选列表（confidence标记为0.5）
+        """
+        logger.info("Attempting fallback retrieval for query: %s", query)
+
+        # Strategy 1: Lower score threshold
+        node_candidates: Dict[str, Any] = {}
+
+        # Re-run graph searches (same as before)
+        graph_tasks = []
+        for entity in entities:
+            graph_tasks.append(self._search_by_name(entity, tenant_id, user_id))
+            graph_tasks.append(self._search_by_alias(entity, tenant_id, user_id))
+        for kw in keywords:
+            graph_tasks.append(self._search_fuzzy(kw, tenant_id, user_id))
+
+        if graph_tasks:
+            results = await asyncio.gather(*graph_tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    continue
+                for node in result:
+                    if node.id not in node_candidates:
+                        node_candidates[node.id] = node
+
+        # Strategy 2: Expand traversal depth to 3 hops
+        if node_candidates:
+            traversal_tasks = [
+                self._traverse_deep(node_id) for node_id in list(node_candidates.keys())[:5]
+            ]
+            traversal_results = await asyncio.gather(*traversal_tasks, return_exceptions=True)
+            for tresult in traversal_results:
+                if isinstance(tresult, Exception):
+                    continue
+                for row in tresult:
+                    node_id = row.get("to_id")
+                    if node_id and node_id not in node_candidates:
+                        node_candidates[node_id] = self._node_from_traversal(row)
+
+        # Strategy 3: Relaxed keyword matching (shorter substrings)
+        if not node_candidates:
+            # Try matching with shorter substrings (2+ chars instead of full keywords)
+            all_terms = entities + keywords
+            short_terms = []
+            for term in all_terms:
+                if len(term) >= 4:
+                    # Extract 2-3 char substrings
+                    short_terms.append(term[:3])
+                    short_terms.append(term[-3:])
+                elif len(term) >= 2:
+                    short_terms.append(term)
+
+            for term in short_terms[:10]:  # Limit to avoid too many queries
+                try:
+                    fuzzy_results = await self.graph.find_nodes_fuzzy(term, tenant_id, user_id)
+                    for node in fuzzy_results:
+                        if node.id not in node_candidates:
+                            node_candidates[node.id] = node
+                except Exception as e:
+                    logger.warning("Fallback fuzzy search failed for '%s': %s", term, e)
+
+        if not node_candidates:
+            logger.info("Fallback retrieval found no candidates")
+            return []
+
+        # Score candidates with LOWER threshold (0.15 instead of 0.25)
+        buffer_units = []
+        try:
+            buffer_units = self.buffer.read_recent(tenant_id, user_id, limit=20)
+        except Exception:
+            pass
+
+        scored = self._score_candidates(
+            list(node_candidates.values()), buffer_units, query, entities, keywords, current_emotion
+        )
+
+        # Apply lower threshold
+        FALLBACK_THRESHOLD = 0.15
+        scored = [c for c in scored if c["score"] >= FALLBACK_THRESHOLD]
+
+        if not scored:
+            logger.info("Fallback retrieval: no candidates passed lower threshold")
+            return []
+
+        # Mark all fallback results with lower confidence
+        for candidate in scored[:max_results]:
+            candidate["confidence"] = 0.5  # Lower confidence for fallback results
+
+        logger.info("Fallback retrieval found %d candidates (confidence=0.5)", len(scored[:max_results]))
+        return scored[:max_results]
+
+    async def _traverse_deep(self, node_id: str) -> list:
+        """Traverse relations with depth=3 for fallback retrieval."""
+        try:
+            return await self.graph.traverse_relations(node_id, max_depth=3)
+        except Exception as e:
+            logger.warning("Deep traversal failed for '%s': %s", node_id, e)
+            return []

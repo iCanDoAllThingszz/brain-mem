@@ -652,6 +652,7 @@ Return ONLY valid JSON:
         1. Tag归属：查tag字典，确定实体应归入哪个tag
         2. 同类检索：按tag去图谱检索同类实体
         3. LLM判断：create/merge/update + 关系构建（一次调用）
+        4. 干扰检测：检查是否存在高度相似的旧实体，标记冲突或更新关系
         """
         name = raw_entity.get("name", "").strip()
         raw_tags = raw_entity.get("tags", [])
@@ -786,7 +787,7 @@ Return ONLY valid JSON:
                 action = "create"
                 final_name = name
 
-        return {
+        resolution_result = {
             "action": action,
             "final_name": final_name,
             "resolved_tags": final_tags,
@@ -797,6 +798,125 @@ Return ONLY valid JSON:
             "new_relations": result.get("new_relations", []),
             "reason": result.get("reason", ""),
         }
+
+        # --- Step 5: Interference detection ---
+        # Check if this is an update that interferes with old information
+        if action == "update" and existing_id:
+            interference_result = await self._check_interference(
+                existing_id, raw_entity, resolution_result, tenant_id, user_id
+            )
+            # Merge interference results into resolution
+            if interference_result:
+                resolution_result["properties_update"] = {
+                    **resolution_result.get("properties_update", {}),
+                    **interference_result.get("properties_update", {}),
+                }
+                resolution_result["relations_to_invalidate"] = interference_result.get("relations_to_invalidate", [])
+
+        return resolution_result
+
+    # ------------------------------------------------------------------
+    # Interference detection
+    # ------------------------------------------------------------------
+
+    async def _check_interference(
+        self,
+        existing_id: str,
+        new_entity: Dict[str, Any],
+        resolution: Dict[str, Any],
+        tenant_id: str,
+        user_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        检测新旧信息之间的干扰，判断是否存在矛盾或状态更新。
+
+        Args:
+            existing_id: 已存在的实体ID
+            new_entity: 新提取的实体信息
+            resolution: LLM解析结果
+            tenant_id: 租户ID
+            user_id: 用户ID
+
+        Returns:
+            Dict with interference handling instructions, or None if no interference
+        """
+        try:
+            # Get the existing node
+            existing_node = await self.graph.get_node(existing_id)
+            if not existing_node:
+                return None
+
+            old_summary = existing_node.summary or ""
+            new_summary = resolution.get("summary_update") or new_entity.get("summary", "")
+
+            if not old_summary or not new_summary:
+                return None
+
+            # Use LLM to detect if there's a contradiction or state change
+            system_prompt = """\
+You are an interference detector for a memory system. Compare old and new information about the same entity.
+
+Determine the relationship:
+1. "contradiction" - New info directly contradicts old info (e.g., "works at A" vs "works at B")
+2. "state_update" - New info represents a state change (e.g., "joined company" → "left company")
+3. "complement" - New info adds to old info without conflict
+4. "duplicate" - New info is essentially the same as old info
+
+Return ONLY valid JSON:
+{
+  "relationship": "contradiction" | "state_update" | "complement" | "duplicate",
+  "reason": "brief explanation",
+  "affected_relation_types": ["WORKS_AT", "LOCATED_IN"]
+}
+"""
+            user_prompt = f"""Entity: {existing_node.name}
+
+Old information: {old_summary}
+
+New information: {new_summary}
+
+What is the relationship between old and new information?"""
+
+            result = await call_llm_json(system_prompt, user_prompt, temperature=0.1)
+            relationship = result.get("relationship", "complement")
+
+            interference_result = {}
+
+            if relationship == "contradiction":
+                # Mark conflict for consolidator to resolve
+                interference_result["properties_update"] = {
+                    "_conflict_with": existing_id,
+                    "_conflict_old_summary": old_summary,
+                    "_conflict_new_summary": new_summary,
+                    "_conflict_detected_at": datetime.utcnow().isoformat(),
+                }
+                logger.info("Detected contradiction for entity %s: %s", existing_node.name, result.get("reason"))
+
+            elif relationship == "state_update":
+                # Mark old relations as invalid and reduce retrieval strength
+                affected_types = result.get("affected_relation_types", [])
+                interference_result["relations_to_invalidate"] = affected_types
+
+                # Reduce old node's retrieval strength by 50%
+                new_strength = max(existing_node.retrieval_strength * 0.5, 0.1)
+                await self.graph.update_node(existing_id, {
+                    "retrieval_strength": new_strength,
+                    "updated_at": datetime.utcnow().isoformat(),
+                })
+
+                logger.info("Detected state update for entity %s: %s (strength %.1f→%.1f)",
+                           existing_node.name, result.get("reason"),
+                           existing_node.retrieval_strength, new_strength)
+
+            elif relationship == "duplicate":
+                # No action needed, just log
+                logger.debug("Detected duplicate information for entity %s", existing_node.name)
+
+            return interference_result if interference_result else None
+
+        except Exception as e:
+            logger.warning("Interference detection failed for %s: %s", existing_id, e)
+            return None
 
     # ------------------------------------------------------------------
     # Importance computation
