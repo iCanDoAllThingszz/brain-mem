@@ -150,6 +150,13 @@ class Consolidator:
         except Exception as e:
             logger.error("apply_decay failed: %s", e)
 
+        # Step 6: Check spaced repetition (mark important memories for review)
+        try:
+            review_count = await self._check_spaced_repetition(tenant_id, user_id)
+            stats["memories_marked_for_review"] = review_count
+        except Exception as e:
+            logger.warning("Spaced repetition check failed: %s", e)
+
         log_event("consolidation_complete",
             f"created={stats['nodes_created']} updated={stats['nodes_updated']} "
             f"merged={stats['nodes_merged']} rels={stats['relations_created']}",
@@ -507,4 +514,118 @@ How should we resolve this conflict?"""
 
         except Exception as e:
             logger.error("Conflict resolution scan failed: %s", e)
+            return 0
+
+    # ------------------------------------------------------------------
+    # Spaced repetition
+    # ------------------------------------------------------------------
+
+    async def _check_spaced_repetition(self, tenant_id: str, user_id: str) -> int:
+        """
+        扫描图谱中所有active节点，找出重要但快被遗忘的记忆，标记为需要复习。
+
+        间隔重复算法：
+        - 第1次复习：1天后
+        - 第2次复习：3天后
+        - 第3次复习：7天后
+        - 第4次复习：21天后
+        - 之后每次间隔翻倍
+
+        Args:
+            tenant_id: 租户ID
+            user_id: 用户ID
+
+        Returns:
+            标记为需要复习的节点数量
+        """
+        try:
+            # Find all active nodes with importance >= 6
+            all_nodes = await self.graph.find_active_nodes(tenant_id, user_id, min_strength=0.0)
+            important_nodes = [n for n in all_nodes if n.importance >= 6.0]
+
+            if not important_nodes:
+                return 0
+
+            now = datetime.utcnow()
+            marked_count = 0
+
+            # Spaced repetition intervals (in days)
+            INTERVALS = [1, 3, 7, 21]  # First 4 reviews
+
+            for node in important_nodes:
+                props = node.properties or {}
+
+                # Skip if already marked for review
+                if props.get("needs_review"):
+                    continue
+
+                # Get review history
+                review_count = props.get("review_count", 0)
+                last_review_date_str = props.get("last_review_date")
+                next_review_date_str = props.get("next_review_date")
+
+                # Calculate next review date based on review count
+                if review_count < len(INTERVALS):
+                    interval_days = INTERVALS[review_count]
+                else:
+                    # After 4th review, double the interval each time
+                    interval_days = INTERVALS[-1] * (2 ** (review_count - len(INTERVALS) + 1))
+
+                # Determine if review is needed
+                needs_review = False
+
+                if not last_review_date_str:
+                    # Never reviewed, use last_accessed as baseline
+                    last_accessed = node.last_accessed
+                    if isinstance(last_accessed, datetime):
+                        last_accessed_dt = last_accessed
+                    elif isinstance(last_accessed, str):
+                        try:
+                            last_accessed_dt = datetime.fromisoformat(last_accessed.replace("Z", "+00:00"))
+                            last_accessed_dt = last_accessed_dt.replace(tzinfo=None)
+                        except Exception:
+                            last_accessed_dt = now
+                    else:
+                        last_accessed_dt = now
+
+                    days_since_access = (now - last_accessed_dt).days
+                    # If retrieval_strength is dropping and it's been a while, mark for review
+                    if node.retrieval_strength < 3.0 and days_since_access >= interval_days:
+                        needs_review = True
+                        next_review_date = now
+                else:
+                    # Has review history, check if next review date has passed
+                    if next_review_date_str:
+                        try:
+                            next_review_dt = datetime.fromisoformat(next_review_date_str.replace("Z", "+00:00"))
+                            next_review_dt = next_review_dt.replace(tzinfo=None)
+                            if now >= next_review_dt:
+                                needs_review = True
+                                next_review_date = now
+                        except Exception:
+                            pass
+
+                if needs_review:
+                    # Mark node for review
+                    updates = {
+                        "properties": {
+                            **props,
+                            "needs_review": True,
+                            "next_review_date": next_review_date.isoformat(),
+                        }
+                    }
+                    await self.graph.update_node(node.id, updates)
+                    marked_count += 1
+                    logger.info(
+                        "Marked node %s (entity=%s, importance=%.1f, strength=%.1f) for spaced repetition review",
+                        node.id[:8], node.name, node.importance, node.retrieval_strength
+                    )
+
+            if marked_count > 0:
+                logger.info("Spaced repetition: marked %d memories for review", marked_count)
+
+            return marked_count
+
+        except Exception as e:
+            logger.error("Spaced repetition check failed: %s", e)
             return 0

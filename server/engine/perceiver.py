@@ -98,7 +98,7 @@ For "noise" or "command" types, rewrite should be null.
 Return ONLY valid JSON:
 {
   "type": "noise" | "command" | "informative",
-  "category": "cognition" | "log_diet" | "log_exercise" | "log_interview" | "log_trading" | "log_learning" | "log_general" | "reconsolidation" | "prospective",
+  "category": "cognition" | "log_diet" | "log_exercise" | "log_interview" | "log_trading" | "log_learning" | "log_general" | "reconsolidation" | "prospective" | "forget",
   "target_entity": "entity name that should be updated (e.g., '减肥计划', '跳槽计划')" | null,
   "correction_type": "correct" | "supplement" | "reframe" | null,
   "trigger_type": "time" | "event" | "condition" | null,
@@ -144,10 +144,18 @@ Category rules:
     * "明天早上9点提醒我交报告" → trigger_type="time", trigger_value="2026-03-15T09:00:00+08:00", action="提醒交报告" \
     * "下次聊到减肥时提醒我记录饮食" → trigger_type="event", trigger_value="减肥", action="提醒记录饮食" \
     * "如果BTC跌破6万提醒我" → trigger_type="condition", trigger_value="BTC<60000", action="提醒BTC跌破6万"
+- "forget": User wants to FORGET or SUPPRESS a memory. \
+  This is motivated forgetting — actively suppressing unwanted memories. \
+  ALWAYS set target_entity: The entity/memory to forget (e.g., "张三", "那次失败的面试") \
+  Examples: \
+    * "忘掉张三这个人" → category="forget", target_entity="张三" \
+    * "不要再提那次失败的面试" → category="forget", target_entity="那次失败的面试" \
+    * "删掉关于前公司的记忆" → category="forget", target_entity="前公司"
 
 For log categories, ALWAYS set target_entity (use the defaults above if unsure).
 For reconsolidation category, ALWAYS set target_entity and correction_type.
 For prospective category, ALWAYS set trigger_type, trigger_value, and action.
+For forget category, ALWAYS set target_entity.
 For cognition category or noise/command types, target_entity and correction_type should be null.
 """
 
@@ -196,7 +204,7 @@ class Perceiver:
             category = result.get("category", "cognition")
             valid_categories = {
                 "cognition", "log_diet", "log_exercise", "log_interview",
-                "log_trading", "log_learning", "log_general", "reconsolidation", "prospective"
+                "log_trading", "log_learning", "log_general", "reconsolidation", "prospective", "forget"
             }
             if category not in valid_categories:
                 logger.warning("Unexpected category '%s', defaulting to cognition", category)
@@ -211,6 +219,17 @@ class Perceiver:
             # Validate target_entity and correction_type based on category
             if msg_type != "informative" or category == "cognition":
                 target_entity = None
+                correction_type = None
+                trigger_type = None
+                trigger_value = None
+                action = None
+            elif category == "forget":
+                # Forget requires target_entity
+                if not target_entity:
+                    logger.warning("Forget missing target_entity, defaulting to command")
+                    msg_type = "command"
+                    category = "cognition"
+                    target_entity = None
                 correction_type = None
                 trigger_type = None
                 trigger_value = None

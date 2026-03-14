@@ -279,17 +279,18 @@ async def _process_after_response(
             memory_input = rewrite or user_message
             category = perception.get("category", "cognition")
 
-            # Log-type, reconsolidation, and prospective messages bypass evaluator
+            # Log-type, reconsolidation, prospective, and forget messages bypass evaluator
             # Logs are always worth recording, reconsolidations are user-initiated corrections
             # Prospective memories are always important (reminders)
-            if category.startswith("log_") or category == "reconsolidation" or category == "prospective":
+            # Forget commands are always executed immediately
+            if category.startswith("log_") or category == "reconsolidation" or category == "prospective" or category == "forget":
                 evaluation = {
                     "task_relevance": 5,
                     "emotional_intensity": 0,
                     "emotion_type": "neutral",
                     "novelty": 5,
                     "encode_decision": True,
-                    "encode_priority": "high" if category == "prospective" else "low",
+                    "encode_priority": "high" if category in ("prospective", "forget") else "low",
                     "reason": f"{category} message, auto-encode",
                     "category": category,
                     "target_entity": perception.get("target_entity"),
