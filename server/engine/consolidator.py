@@ -8,6 +8,7 @@ v2: Adapted for encoder v2 (action/aliases_to_add/tag merge) + per-unit archive.
 
 from __future__ import annotations
 
+import json
 import logging
 import random
 from datetime import datetime
@@ -24,9 +25,11 @@ from server.storage.tag_dict import TagDict
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Graph hygiene constants
+# Minimal hardcoded rules (fallback only)
 # ---------------------------------------------------------------------------
-USER_ALIASES = {"我", "用户", "用户本人", "本人", "禹哥"}
+# Pronouns that always map to the user's primary node
+PRONOUN_TO_USER = {"我", "用户", "用户本人", "本人"}
+# Primary user name (can be fetched from config or graph)
 PRIMARY_USER = "赵禹"
 
 _PATTERN_SYSTEM = """\
@@ -72,24 +75,6 @@ Return ONLY valid JSON:
   "reasoning": "why these fragments are connected",
   "actionable": "how the user can leverage this insight",
   "source_nodes": ["node_name1", "node_name2"]
-}
-"""
-
-_SIMILAR_ENTITY_SYSTEM = """\
-You are a duplicate detection engine for a memory system. Two memory nodes may be duplicates.
-
-Analyze the following two nodes and decide if they should be merged:
-
-Rules:
-- If both refer to the same entity/concept/person → merge (keep the more complete one)
-- If they are similar but refer to different things → keep_both
-- If unsure → unsure (prefer keeping both to avoid data loss)
-
-Return ONLY valid JSON:
-{
-  "decision": "merge" | "keep_both" | "unsure",
-  "keep": "A" | "B",
-  "reason": "brief explanation"
 }
 """
 
@@ -199,28 +184,18 @@ class Consolidator:
 
         # Step 5.7: Graph hygiene / cleaning (after all writes complete)
         try:
-            merged_users = await self._merge_user_aliases(tenant_id, user_id)
-            stats["users_merged"] = merged_users
+            review_stats = await self._llm_graph_review(tenant_id, user_id)
+            stats["llm_review_merged"] = review_stats.get("merged", 0)
+            stats["llm_review_demoted"] = review_stats.get("demoted", 0)
+            stats["llm_review_dormant"] = review_stats.get("dormant", 0)
         except Exception as e:
-            logger.warning("User alias merge failed: %s", e)
-
-        try:
-            similar_merged = await self._detect_similar_entities(tenant_id, user_id)
-            stats["similar_entities_merged"] = similar_merged
-        except Exception as e:
-            logger.warning("Similar entity detection failed: %s", e)
+            logger.warning("LLM graph review failed: %s", e)
 
         try:
             orphans_handled = await self._handle_orphan_nodes(tenant_id, user_id)
             stats["orphans_handled"] = orphans_handled
         except Exception as e:
             logger.warning("Orphan node handling failed: %s", e)
-
-        try:
-            demoted = await self._demote_low_value_nodes(tenant_id, user_id)
-            stats["nodes_demoted"] = demoted
-        except Exception as e:
-            logger.warning("Low-value node demotion failed: %s", e)
 
         try:
             await self.graph.apply_decay(tenant_id, user_id)
@@ -844,163 +819,164 @@ How should we resolve this conflict?"""
     # Graph hygiene / cleaning
     # ------------------------------------------------------------------
 
-    async def _merge_user_aliases(self, tenant_id: str, user_id: str) -> int:
+    async def _llm_graph_review(self, tenant_id: str, user_id: str) -> Dict[str, int]:
         """
-        Merge user alias nodes into the primary user node.
-        Hard rule: no LLM needed.
+        LLM-driven global graph review and hygiene.
+
+        Fetches all active nodes, sends them to LLM in batches for review.
+        LLM decides for each node:
+        - keep: No action needed
+        - merge: Merge into another node (duplicate)
+        - demote: Lower importance (low-value content)
+        - dormant: Mark as dormant (outdated/worthless)
 
         Returns:
-            Number of nodes merged
+            Stats dict with counts of actions taken
         """
+        stats = {"merged": 0, "demoted": 0, "dormant": 0}
+
         try:
-            merged_count = 0
-
-            # Find primary user node
-            primary_nodes = await self.graph.find_nodes_by_name(PRIMARY_USER, tenant_id, user_id)
-            if not primary_nodes:
-                # Primary user doesn't exist yet, skip
-                logger.info("Primary user node '%s' not found, skipping alias merge", PRIMARY_USER)
-                return 0
-
-            primary_node = primary_nodes[0]
-
-            # Find and merge each alias
-            for alias in USER_ALIASES:
-                alias_nodes = await self.graph.find_nodes_by_name(alias, tenant_id, user_id)
-                for alias_node in alias_nodes:
-                    if alias_node.id == primary_node.id:
-                        continue  # Skip if it's the primary node itself
-
-                    try:
-                        # Merge alias node into primary node
-                        await self.graph.merge_nodes(primary_node.id, alias_node.id)
-                        merged_count += 1
-                        log_event("graph_hygiene_user_merge",
-                                 f"Merged '{alias}' into '{PRIMARY_USER}'",
-                                 {"alias": alias, "primary": PRIMARY_USER})
-                        logger.info("Merged user alias '%s' (%s) into '%s' (%s)",
-                                   alias, alias_node.id[:8], PRIMARY_USER, primary_node.id[:8])
-                    except Exception as e:
-                        logger.warning("Failed to merge alias '%s': %s", alias, e)
-
-            if merged_count > 0:
-                logger.info("User alias merge: merged %d nodes into '%s'", merged_count, PRIMARY_USER)
-
-            return merged_count
-
-        except Exception as e:
-            logger.error("User alias merge failed: %s", e)
-            return 0
-
-    async def _detect_similar_entities(self, tenant_id: str, user_id: str) -> int:
-        """
-        Detect and merge similar entities using LLM judgment.
-        Limit to 5 LLM calls per consolidation to control costs.
-
-        Returns:
-            Number of nodes merged
-        """
-        try:
+            # Fetch all active nodes
             all_nodes = await self.graph.find_active_nodes(tenant_id, user_id)
-            if len(all_nodes) < 2:
-                return 0
+            if not all_nodes:
+                logger.info("No active nodes to review")
+                return stats
 
-            # Group nodes by tags for more efficient comparison
-            tag_groups: Dict[str, List[Node]] = {}
-            for node in all_nodes:
-                for tag in node.tags:
-                    if tag not in tag_groups:
-                        tag_groups[tag] = []
-                    tag_groups[tag].append(node)
+            logger.info("LLM graph review: reviewing %d nodes", len(all_nodes))
 
-            merged_count = 0
-            llm_calls = 0
-            MAX_LLM_CALLS = 5
+            # Process in batches (max 30 nodes per batch, max 3 batches = 90 nodes)
+            batch_size = 30
+            max_batches = 3
+            batches = [all_nodes[i:i + batch_size] for i in range(0, len(all_nodes), batch_size)]
+            batches = batches[:max_batches]
 
-            # Compare nodes within same tag groups
-            for tag, nodes in tag_groups.items():
-                if llm_calls >= MAX_LLM_CALLS:
-                    break
+            for batch_idx, batch in enumerate(batches):
+                logger.info("Processing batch %d/%d (%d nodes)", batch_idx + 1, len(batches), len(batch))
 
-                if len(nodes) < 2:
+                # Build node summary for LLM
+                nodes_json = []
+                for node in batch:
+                    nodes_json.append({
+                        "name": node.name,
+                        "tags": node.tags,
+                        "summary": node.summary or "",
+                        "aliases": node.aliases,
+                        "importance": node.importance,
+                    })
+
+                system_prompt = """\
+You are a knowledge graph maintenance expert. Review the following nodes from a personal knowledge graph.
+
+Return ONLY valid JSON array:
+[
+  {
+    "name": "node name",
+    "action": "keep|merge|demote|dormant",
+    "merge_into": "target node name (for merge) or null",
+    "reason": "brief reason"
+  }
+]
+
+Actions:
+1. "keep" — Valuable, keep as-is
+2. "merge" — Duplicate of another node, should merge
+   - Specify merge_into (target node name)
+3. "demote" — Low value, reduce importance
+   - Reasons: trivial details, over-abstraction, debug residue, universal concepts
+4. "dormant" — Outdated or worthless, should be dormant
+
+Principles:
+- People, organizations, projects, plans → usually keep
+- Same person/thing with different names → merge (e.g., "赵禹" and "禹哥")
+- Pronoun nodes ("我", "用户", "本人") → merge to user's primary node
+- Pure numbers, specific food items → demote
+- Debug/technical details from testing → demote or dormant
+- When uncertain → keep (prefer to preserve)
+"""
+
+                user_prompt = f"""\
+Node list:
+{json.dumps(nodes_json, ensure_ascii=False, indent=2)}
+"""
+
+                # Call LLM
+                try:
+                    result = await call_llm_json(system_prompt, user_prompt, temperature=0.2)
+                    actions = result if isinstance(result, list) else result.get("actions", [])
+                except Exception as e:
+                    logger.error("LLM graph review batch %d failed: %s. Skipping batch.", batch_idx + 1, e)
                     continue
 
-                # Compare pairs
-                for i in range(len(nodes)):
-                    for j in range(i + 1, len(nodes)):
-                        if llm_calls >= MAX_LLM_CALLS:
-                            break
+                # Execute actions
+                action_map = {a.get("name", ""): a for a in actions}
+                for node in batch:
+                    action_data = action_map.get(node.name)
+                    if not action_data:
+                        continue
 
-                        node_a = nodes[i]
-                        node_b = nodes[j]
+                    action = action_data.get("action", "keep")
+                    reason = action_data.get("reason", "")
 
-                        # Check if names are similar
-                        name_a = node_a.name.lower()
-                        name_b = node_b.name.lower()
+                    if action == "keep":
+                        continue
 
-                        # Skip if names are too different
-                        if name_a == name_b:
-                            is_similar = True
-                        elif name_a in name_b or name_b in name_a:
-                            is_similar = True
-                        else:
-                            # Simple edit distance check
-                            import difflib
-                            similarity = difflib.SequenceMatcher(None, name_a, name_b).ratio()
-                            is_similar = similarity > 0.8
-
-                        if not is_similar:
+                    elif action == "merge":
+                        merge_into = action_data.get("merge_into")
+                        if not merge_into:
+                            logger.warning("Merge action for '%s' missing target, skipping", node.name)
                             continue
 
-                        # Ask LLM to judge
-                        user_prompt = f"""节点A: {node_a.name} | tags: {node_a.tags} | summary: {node_a.summary or '(无)'}
+                        # Find target node
+                        target_nodes = await self.graph.find_nodes_by_name(merge_into, tenant_id, user_id)
+                        if not target_nodes:
+                            logger.warning("Merge target '%s' not found for '%s', skipping", merge_into, node.name)
+                            continue
 
-节点B: {node_b.name} | tags: {node_b.tags} | summary: {node_b.summary or '(无)'}
-
-判断规则：
-- 如果两者指的是同一个事物/概念/人 → merge（合并到更完整的那个）
-- 如果两者虽然名称相似但含义不同 → keep_both
-- 如果不确定 → unsure（宁可保留，不要误删）"""
+                        target_node = target_nodes[0]
+                        if target_node.id == node.id:
+                            logger.warning("Cannot merge node '%s' into itself, skipping", node.name)
+                            continue
 
                         try:
-                            result = await call_llm_json(
-                                _SIMILAR_ENTITY_SYSTEM,
-                                user_prompt,
-                                temperature=0.1
-                            )
-                            llm_calls += 1
-
-                            decision = result.get("decision", "unsure")
-
-                            if decision == "merge":
-                                keep = result.get("keep", "A")
-                                keep_id = node_a.id if keep == "A" else node_b.id
-                                remove_id = node_b.id if keep == "A" else node_a.id
-
-                                try:
-                                    await self.graph.merge_nodes(keep_id, remove_id)
-                                    merged_count += 1
-                                    log_event("graph_hygiene_similar_merge",
-                                             f"Merged similar entities: {node_a.name} + {node_b.name}",
-                                             {"keep": keep, "reason": result.get("reason", "")})
-                                    logger.info("Merged similar entities: '%s' + '%s' (reason: %s)",
-                                               node_a.name, node_b.name, result.get("reason", ""))
-                                except Exception as e:
-                                    logger.warning("Failed to merge similar entities: %s", e)
-
+                            await self.graph.merge_nodes(target_node.id, node.id)
+                            stats["merged"] += 1
+                            log_event("llm_graph_review_merge",
+                                     f"Merged '{node.name}' into '{merge_into}': {reason}",
+                                     {"source": node.name, "target": merge_into, "reason": reason})
+                            logger.info("Merged '%s' into '%s': %s", node.name, merge_into, reason)
                         except Exception as e:
-                            logger.warning("LLM call failed for similar entity detection: %s", e)
-                            llm_calls += 1  # Count failed calls too
+                            logger.warning("Failed to merge '%s' into '%s': %s", node.name, merge_into, e)
 
-            if merged_count > 0:
-                logger.info("Similar entity detection: merged %d pairs (used %d LLM calls)",
-                           merged_count, llm_calls)
+                    elif action == "demote":
+                        try:
+                            # Reduce importance by 0.3
+                            new_importance = max(0.0, node.importance - 0.3)
+                            await self.graph.update_node(node.id, {"importance": new_importance})
+                            stats["demoted"] += 1
+                            log_event("llm_graph_review_demote",
+                                     f"Demoted '{node.name}': {reason}",
+                                     {"node": node.name, "reason": reason})
+                            logger.info("Demoted '%s': %s", node.name, reason)
+                        except Exception as e:
+                            logger.warning("Failed to demote '%s': %s", node.name, e)
 
-            return merged_count
+                    elif action == "dormant":
+                        try:
+                            await self.graph.update_node(node.id, {"status": "dormant"})
+                            stats["dormant"] += 1
+                            log_event("llm_graph_review_dormant",
+                                     f"Marked '{node.name}' as dormant: {reason}",
+                                     {"node": node.name, "reason": reason})
+                            logger.info("Marked '%s' as dormant: %s", node.name, reason)
+                        except Exception as e:
+                            logger.warning("Failed to mark '%s' as dormant: %s", node.name, e)
+
+            logger.info("LLM graph review complete: %s", stats)
+            return stats
 
         except Exception as e:
-            logger.error("Similar entity detection failed: %s", e)
-            return 0
+            logger.error("LLM graph review failed: %s", e)
+            return stats
 
     async def _handle_orphan_nodes(self, tenant_id: str, user_id: str) -> int:
         """
@@ -1078,56 +1054,4 @@ How should we resolve this conflict?"""
 
         except Exception as e:
             logger.error("Orphan node handling failed: %s", e)
-            return 0
-
-    async def _demote_low_value_nodes(self, tenant_id: str, user_id: str) -> int:
-        """
-        Demote low-value nodes by reducing their importance.
-        They will naturally decay to dormant status later.
-
-        Returns:
-            Number of nodes demoted
-        """
-        try:
-            import re
-
-            all_nodes = await self.graph.find_active_nodes(tenant_id, user_id)
-
-            demoted_count = 0
-
-            for node in all_nodes:
-                should_demote = False
-                new_importance = node.importance
-
-                # Check for pure numeric nodes
-                if re.match(r"^\d+大卡$", node.name) or re.match(r"^\d+kg$", node.name) or re.match(r"^\d+公里$", node.name):
-                    should_demote = True
-                    new_importance = 1.0
-
-                # Check for pure food nodes (without preference)
-                elif "食物" in node.tags and "偏好" not in node.tags:
-                    should_demote = True
-                    new_importance = 1.0
-
-                # Check for debug/technical detail nodes
-                elif node.summary and any(keyword in node.summary for keyword in ["调试", "排查", "测试"]):
-                    should_demote = True
-                    new_importance = 2.0
-
-                if should_demote and node.importance > new_importance:
-                    try:
-                        await self.graph.update_node(node.id, {"importance": new_importance})
-                        demoted_count += 1
-                        logger.info("Demoted low-value node '%s' from %.1f to %.1f",
-                                   node.name, node.importance, new_importance)
-                    except Exception as e:
-                        logger.warning("Failed to demote node '%s': %s", node.name, e)
-
-            if demoted_count > 0:
-                logger.info("Low-value demotion: demoted %d nodes", demoted_count)
-
-            return demoted_count
-
-        except Exception as e:
-            logger.error("Low-value node demotion failed: %s", e)
             return 0
