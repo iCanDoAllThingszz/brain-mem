@@ -161,6 +161,11 @@ class Encoder:
             return await self._encode_log(
                 message, evaluation, category, tenant_id, user_id, session_id
             )
+        elif category == "reconsolidation":
+            # Reconsolidation flow: update existing nodes
+            return await self._encode_reconsolidation(
+                message, evaluation, tenant_id, user_id, session_id
+            )
         else:
             logger.warning("Unknown category '%s', defaulting to cognition", category)
             return await self._encode_cognition(
@@ -327,6 +332,151 @@ class Encoder:
             "session_id": session_id,
             "timestamp": datetime.utcnow().isoformat(),
         }
+
+    async def _encode_reconsolidation(
+        self,
+        message: str,
+        evaluation: Dict[str, Any],
+        tenant_id: str,
+        user_id: str,
+        session_id: str,
+    ) -> Dict[str, Any]:
+        """
+        Reconsolidation encoding flow: update existing nodes based on corrections.
+
+        Args:
+            message: Correction message content
+            evaluation: Evaluation dict (contains category, target_entity, correction_type)
+            tenant_id: Tenant ID
+            user_id: User ID
+            session_id: Session ID
+
+        Returns:
+            Dict with keys: type="reconsolidation", nodes_updated, correction_type
+        """
+        target_entity = evaluation.get("target_entity")
+        correction_type = evaluation.get("correction_type", "correct")
+
+        if not target_entity:
+            logger.warning("Reconsolidation missing target_entity, skipping")
+            return {"skipped": True, "reason": "missing_target_entity"}
+
+        # Step 1: Find the target node(s) by name or fuzzy match
+        nodes = await self.graph.find_nodes_by_name(target_entity, tenant_id, user_id)
+        if not nodes:
+            # Try fuzzy search
+            nodes = await self.graph.find_nodes_fuzzy(target_entity, tenant_id, user_id)
+
+        if not nodes:
+            logger.warning("Target entity '%s' not found for reconsolidation", target_entity)
+            return {"skipped": True, "reason": "target_entity_not_found", "target_entity": target_entity}
+
+        # Use the first matching node (most relevant)
+        node = nodes[0]
+        node_id = node.id
+
+        # Step 2: Prepare updates based on correction_type
+        updates = {}
+        old_values = {}
+
+        if correction_type == "correct":
+            # Factual correction: update summary/content
+            old_values["summary"] = node.summary
+            old_values["content"] = node.content
+            updates["summary"] = message
+            updates["content"] = message
+
+        elif correction_type == "supplement":
+            # Supplement: append to existing content
+            old_values["content"] = node.content
+            new_content = f"{node.content}\n{message}" if node.content else message
+            updates["content"] = new_content
+            # Also update summary to reflect the supplement
+            updates["summary"] = f"{node.summary} | {message[:50]}" if node.summary else message[:50]
+
+        elif correction_type == "reframe":
+            # Emotional reframe: update emotional_tag
+            old_values["emotional_tag"] = node.emotional_tag
+            # Use LLM to extract new emotional tag from message
+            new_emotion = await self._extract_emotion(message)
+            updates["emotional_tag"] = new_emotion
+
+        # Step 3: Record correction history in properties
+        correction_history = node.properties.get("_correction_history", [])
+        correction_history.append({
+            "timestamp": datetime.utcnow().isoformat(),
+            "correction_type": correction_type,
+            "old_values": old_values,
+            "message": message,
+            "session_id": session_id,
+        })
+
+        # Limit history to last 10 corrections
+        if len(correction_history) > 10:
+            correction_history = correction_history[-10:]
+
+        updates["properties"] = {
+            **node.properties,
+            "_correction_history": correction_history,
+        }
+
+        # Step 4: Increment version
+        updates["version"] = node.version + 1
+
+        # Step 5: Update the node
+        await self.graph.update_node(node_id, updates)
+
+        logger.info(
+            "Reconsolidation: updated node %s (entity=%s, type=%s, version=%d→%d)",
+            node_id[:8], target_entity, correction_type, node.version, node.version + 1
+        )
+
+        return {
+            "type": "reconsolidation",
+            "node_id": node_id,
+            "target_entity": target_entity,
+            "correction_type": correction_type,
+            "nodes_updated": 1,
+            "old_version": node.version,
+            "new_version": node.version + 1,
+            "session_id": session_id,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+
+    async def _extract_emotion(self, message: str) -> Dict[str, Any]:
+        """
+        Extract emotional tag from a message using LLM.
+
+        Returns:
+            Dict with keys: type (joy/sadness/anger/fear/surprise/neutral), intensity (0-10)
+        """
+        system_prompt = """\
+You are an emotion analyzer. Extract the emotional tone from the message.
+
+Return ONLY valid JSON:
+{
+  "type": "joy" | "sadness" | "anger" | "fear" | "surprise" | "neutral",
+  "intensity": 0-10
+}
+"""
+        user_prompt = f'Message:\n"""\n{message}\n"""'
+
+        try:
+            result = await call_llm_json(system_prompt, user_prompt, temperature=0.1)
+            emotion_type = result.get("type", "neutral")
+            intensity = float(result.get("intensity", 0))
+
+            # Validate
+            valid_types = {"joy", "sadness", "anger", "fear", "surprise", "neutral"}
+            if emotion_type not in valid_types:
+                emotion_type = "neutral"
+            if not (0 <= intensity <= 10):
+                intensity = 0
+
+            return {"type": emotion_type, "intensity": intensity}
+        except Exception as e:
+            logger.warning("Emotion extraction failed: %s", e)
+            return {"type": "neutral", "intensity": 0}
 
     async def generate_session_summary(
         self,
