@@ -27,13 +27,15 @@ _EXTRACT_CLUES_SYSTEM = """\
 - 关键词应该是有区分度的动词、名词、形容词
 - 如果查询是纯社交性质（如"嗯嗯"、"好的"、"咋不回我"），返回空列表
 - 如果查询是当前会话的延续（如"一起修复"、"继续"），返回空列表
+- 识别查询中的情感信息（如"开心"、"沮丧"、"生气"、"害怕"、"惊讶"）
 
 只返回有效的JSON：
 {
   "entities": ["实体名1", "实体名2"],
   "keywords": ["关键词1", "关键词2"],
   "time_hint": "today|recent|specific_date|none",
-  "query_intent": "用一句话描述用户想知道什么"
+  "query_intent": "用一句话描述用户想知道什么",
+  "query_emotion": "joy|sadness|anger|fear|surprise|neutral"
 }
 """
 
@@ -135,6 +137,19 @@ class Retriever:
         clues = await self._extract_clues(query)
         entities = clues.get("entities", [])
         keywords = clues.get("keywords", [])
+        query_emotion = clues.get("query_emotion", "neutral")
+
+        # Determine current emotion from query or working memory
+        current_emotion = query_emotion
+        if current_emotion == "neutral" and working_memory:
+            # Fallback to working memory emotional baseline
+            baseline = working_memory.get("emotional_baseline", "neutral")
+            # Map baseline to emotion type
+            if baseline == "positive":
+                current_emotion = "joy"
+            elif baseline == "negative":
+                current_emotion = "sadness"
+            # else: keep neutral
 
         # If no meaningful clues extracted, return empty result
         if not entities and not keywords:
@@ -200,7 +215,7 @@ class Retriever:
 
         # Step 8: Score and rank
         scored = self._score_candidates(
-            list(node_candidates.values()), buffer_units, query, entities, keywords
+            list(node_candidates.values()), buffer_units, query, entities, keywords, current_emotion
         )
 
         # Step 9: Filter by minimum score threshold
@@ -326,13 +341,21 @@ class Retriever:
         query: str,
         entities: List[str],
         keywords: List[str],
+        current_emotion: str = "neutral",
     ) -> List[Dict[str, Any]]:
         """
         Score and merge graph nodes + buffer units into a unified ranked list.
 
-        Composite score = relevance×0.5 + importance×0.15 + recency×0.15
-                        + access_frequency×0.1 + emotional_resonance×0.1
+        Composite score:
+        - When current_emotion is neutral:
+          relevance×0.5 + importance×0.15 + recency×0.15 + access_frequency×0.1 + emotional_resonance×0.1
+        - When current_emotion is non-neutral:
+          relevance×0.4 + importance×0.15 + recency×0.15 + access_frequency×0.1 + emotional_resonance×0.2
         """
+        # Determine if emotional resonance should be weighted higher
+        emotional_weight = 0.2 if current_emotion != "neutral" else 0.1
+        relevance_weight = 0.4 if current_emotion != "neutral" else 0.5
+
         candidates = []
         seen_ids: Set[str] = set()
 
@@ -348,14 +371,16 @@ class Retriever:
             importance = min(float(getattr(node, "importance", 5.0)) / 10.0, 1.0)
             recency = self._recency_score(getattr(node, "last_accessed", ""))
             access_freq = min(float(getattr(node, "access_count", 0)) / 100.0, 1.0)
-            emotional = self._emotional_score(getattr(node, "emotional_tag", {}))
+            emotional = self._emotional_resonance(
+                getattr(node, "emotional_tag", {}), current_emotion
+            )
 
             score = (
-                relevance * 0.5
+                relevance * relevance_weight
                 + importance * 0.15
                 + recency * 0.15
                 + access_freq * 0.1
-                + emotional * 0.1
+                + emotional * emotional_weight
             )
             content = f"{node.name}: {getattr(node, 'summary', '') or getattr(node, 'content', '')}"
             candidates.append({
@@ -377,9 +402,16 @@ class Retriever:
             relevance = self._text_relevance(message, query, entities, keywords)
             importance = min(float(unit.get("importance", 5.0)) / 10.0, 1.0)
             recency = self._recency_score(unit.get("timestamp", ""))
-            emotional = float(unit.get("emotional_intensity", 0)) / 10.0
+            # Buffer units don't have structured emotional_tag, use intensity directly
+            emotional_intensity = float(unit.get("emotional_intensity", 0)) / 10.0
 
-            score = relevance * 0.5 + importance * 0.15 + recency * 0.15 + 0.0 * 0.1 + emotional * 0.1
+            score = (
+                relevance * relevance_weight
+                + importance * 0.15
+                + recency * 0.15
+                + 0.0 * 0.1
+                + emotional_intensity * emotional_weight
+            )
             candidates.append({
                 "id": unit_id,
                 "content": message,
@@ -454,12 +486,62 @@ class Retriever:
             return 0.0
 
     @staticmethod
-    def _emotional_score(emotional_tag: Any) -> float:
-        """Convert emotional_tag to a 0-1 resonance score."""
-        if isinstance(emotional_tag, dict):
-            intensity = float(emotional_tag.get("intensity", 0))
-            return min(intensity / 10.0, 1.0)
-        return 0.0
+    def _emotional_resonance(emotional_tag: Any, current_emotion: str) -> float:
+        """
+        Calculate emotional resonance between node emotion and current emotion (0-1).
+
+        Rules:
+        1. Emotion type matching: same emotion type → high resonance
+        2. Emotion intensity: stronger node emotion → more noticeable resonance
+        3. Special rule: when current emotion is negative, positive "encouraging" memories
+           also get a boost (e.g., past successes when user is sad)
+
+        Args:
+            emotional_tag: Node's emotional_tag dict with "type" and "intensity"
+            current_emotion: Current emotion from query or working memory
+
+        Returns:
+            Resonance score 0-1
+        """
+        if not isinstance(emotional_tag, dict):
+            return 0.0
+
+        node_emotion = emotional_tag.get("type", "neutral")
+        intensity = float(emotional_tag.get("intensity", 0))
+
+        # Normalize intensity to 0-1
+        intensity_normalized = min(intensity / 10.0, 1.0)
+
+        # If current emotion is neutral, just return intensity
+        if current_emotion == "neutral":
+            return intensity_normalized
+
+        # Define emotion categories
+        positive_emotions = {"joy", "surprise"}
+        negative_emotions = {"sadness", "anger", "fear"}
+
+        # Case 1: Exact emotion match → high resonance
+        if node_emotion == current_emotion:
+            return intensity_normalized * 1.0
+
+        # Case 2: Same valence (both positive or both negative) → medium resonance
+        current_is_positive = current_emotion in positive_emotions
+        current_is_negative = current_emotion in negative_emotions
+        node_is_positive = node_emotion in positive_emotions
+        node_is_negative = node_emotion in negative_emotions
+
+        if current_is_positive and node_is_positive:
+            return intensity_normalized * 0.7
+        if current_is_negative and node_is_negative:
+            return intensity_normalized * 0.7
+
+        # Case 3: Special rule - when user is negative, positive memories can be encouraging
+        # Give a moderate boost to positive memories when user is sad/angry/fearful
+        if current_is_negative and node_is_positive and intensity >= 5:
+            return intensity_normalized * 0.5
+
+        # Case 4: Opposite valence with no special rule → low resonance
+        return intensity_normalized * 0.2
 
     async def _reconstruct_context(
         self, query: str, candidates: List[Dict[str, Any]]
