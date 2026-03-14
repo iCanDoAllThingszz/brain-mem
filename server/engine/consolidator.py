@@ -23,6 +23,12 @@ from server.storage.tag_dict import TagDict
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Graph hygiene constants
+# ---------------------------------------------------------------------------
+USER_ALIASES = {"我", "用户", "用户本人", "本人", "禹哥"}
+PRIMARY_USER = "赵禹"
+
 _PATTERN_SYSTEM = """\
 You are a pattern discovery engine for a memory system. \
 Analyze the provided memory fragments and identify cross-event patterns, \
@@ -66,6 +72,24 @@ Return ONLY valid JSON:
   "reasoning": "why these fragments are connected",
   "actionable": "how the user can leverage this insight",
   "source_nodes": ["node_name1", "node_name2"]
+}
+"""
+
+_SIMILAR_ENTITY_SYSTEM = """\
+You are a duplicate detection engine for a memory system. Two memory nodes may be duplicates.
+
+Analyze the following two nodes and decide if they should be merged:
+
+Rules:
+- If both refer to the same entity/concept/person → merge (keep the more complete one)
+- If they are similar but refer to different things → keep_both
+- If unsure → unsure (prefer keeping both to avoid data loss)
+
+Return ONLY valid JSON:
+{
+  "decision": "merge" | "keep_both" | "unsure",
+  "keep": "A" | "B",
+  "reason": "brief explanation"
 }
 """
 
@@ -172,6 +196,31 @@ class Consolidator:
             stats["insights_created"] = insights_created
         except Exception as e:
             logger.warning("Creative recombination failed: %s", e)
+
+        # Step 5.7: Graph hygiene / cleaning (after all writes complete)
+        try:
+            merged_users = await self._merge_user_aliases(tenant_id, user_id)
+            stats["users_merged"] = merged_users
+        except Exception as e:
+            logger.warning("User alias merge failed: %s", e)
+
+        try:
+            similar_merged = await self._detect_similar_entities(tenant_id, user_id)
+            stats["similar_entities_merged"] = similar_merged
+        except Exception as e:
+            logger.warning("Similar entity detection failed: %s", e)
+
+        try:
+            orphans_handled = await self._handle_orphan_nodes(tenant_id, user_id)
+            stats["orphans_handled"] = orphans_handled
+        except Exception as e:
+            logger.warning("Orphan node handling failed: %s", e)
+
+        try:
+            demoted = await self._demote_low_value_nodes(tenant_id, user_id)
+            stats["nodes_demoted"] = demoted
+        except Exception as e:
+            logger.warning("Low-value node demotion failed: %s", e)
 
         try:
             await self.graph.apply_decay(tenant_id, user_id)
@@ -789,4 +838,296 @@ How should we resolve this conflict?"""
 
         except Exception as e:
             logger.error("Creative recombination failed: %s", e)
+            return 0
+
+    # ------------------------------------------------------------------
+    # Graph hygiene / cleaning
+    # ------------------------------------------------------------------
+
+    async def _merge_user_aliases(self, tenant_id: str, user_id: str) -> int:
+        """
+        Merge user alias nodes into the primary user node.
+        Hard rule: no LLM needed.
+
+        Returns:
+            Number of nodes merged
+        """
+        try:
+            merged_count = 0
+
+            # Find primary user node
+            primary_nodes = await self.graph.find_nodes_by_name(PRIMARY_USER, tenant_id, user_id)
+            if not primary_nodes:
+                # Primary user doesn't exist yet, skip
+                logger.info("Primary user node '%s' not found, skipping alias merge", PRIMARY_USER)
+                return 0
+
+            primary_node = primary_nodes[0]
+
+            # Find and merge each alias
+            for alias in USER_ALIASES:
+                alias_nodes = await self.graph.find_nodes_by_name(alias, tenant_id, user_id)
+                for alias_node in alias_nodes:
+                    if alias_node.id == primary_node.id:
+                        continue  # Skip if it's the primary node itself
+
+                    try:
+                        # Merge alias node into primary node
+                        await self.graph.merge_nodes(primary_node.id, alias_node.id)
+                        merged_count += 1
+                        log_event("graph_hygiene_user_merge",
+                                 f"Merged '{alias}' into '{PRIMARY_USER}'",
+                                 {"alias": alias, "primary": PRIMARY_USER})
+                        logger.info("Merged user alias '%s' (%s) into '%s' (%s)",
+                                   alias, alias_node.id[:8], PRIMARY_USER, primary_node.id[:8])
+                    except Exception as e:
+                        logger.warning("Failed to merge alias '%s': %s", alias, e)
+
+            if merged_count > 0:
+                logger.info("User alias merge: merged %d nodes into '%s'", merged_count, PRIMARY_USER)
+
+            return merged_count
+
+        except Exception as e:
+            logger.error("User alias merge failed: %s", e)
+            return 0
+
+    async def _detect_similar_entities(self, tenant_id: str, user_id: str) -> int:
+        """
+        Detect and merge similar entities using LLM judgment.
+        Limit to 5 LLM calls per consolidation to control costs.
+
+        Returns:
+            Number of nodes merged
+        """
+        try:
+            all_nodes = await self.graph.find_active_nodes(tenant_id, user_id)
+            if len(all_nodes) < 2:
+                return 0
+
+            # Group nodes by tags for more efficient comparison
+            tag_groups: Dict[str, List[Node]] = {}
+            for node in all_nodes:
+                for tag in node.tags:
+                    if tag not in tag_groups:
+                        tag_groups[tag] = []
+                    tag_groups[tag].append(node)
+
+            merged_count = 0
+            llm_calls = 0
+            MAX_LLM_CALLS = 5
+
+            # Compare nodes within same tag groups
+            for tag, nodes in tag_groups.items():
+                if llm_calls >= MAX_LLM_CALLS:
+                    break
+
+                if len(nodes) < 2:
+                    continue
+
+                # Compare pairs
+                for i in range(len(nodes)):
+                    for j in range(i + 1, len(nodes)):
+                        if llm_calls >= MAX_LLM_CALLS:
+                            break
+
+                        node_a = nodes[i]
+                        node_b = nodes[j]
+
+                        # Check if names are similar
+                        name_a = node_a.name.lower()
+                        name_b = node_b.name.lower()
+
+                        # Skip if names are too different
+                        if name_a == name_b:
+                            is_similar = True
+                        elif name_a in name_b or name_b in name_a:
+                            is_similar = True
+                        else:
+                            # Simple edit distance check
+                            import difflib
+                            similarity = difflib.SequenceMatcher(None, name_a, name_b).ratio()
+                            is_similar = similarity > 0.8
+
+                        if not is_similar:
+                            continue
+
+                        # Ask LLM to judge
+                        user_prompt = f"""节点A: {node_a.name} | tags: {node_a.tags} | summary: {node_a.summary or '(无)'}
+
+节点B: {node_b.name} | tags: {node_b.tags} | summary: {node_b.summary or '(无)'}
+
+判断规则：
+- 如果两者指的是同一个事物/概念/人 → merge（合并到更完整的那个）
+- 如果两者虽然名称相似但含义不同 → keep_both
+- 如果不确定 → unsure（宁可保留，不要误删）"""
+
+                        try:
+                            result = await call_llm_json(
+                                _SIMILAR_ENTITY_SYSTEM,
+                                user_prompt,
+                                temperature=0.1
+                            )
+                            llm_calls += 1
+
+                            decision = result.get("decision", "unsure")
+
+                            if decision == "merge":
+                                keep = result.get("keep", "A")
+                                keep_id = node_a.id if keep == "A" else node_b.id
+                                remove_id = node_b.id if keep == "A" else node_a.id
+
+                                try:
+                                    await self.graph.merge_nodes(keep_id, remove_id)
+                                    merged_count += 1
+                                    log_event("graph_hygiene_similar_merge",
+                                             f"Merged similar entities: {node_a.name} + {node_b.name}",
+                                             {"keep": keep, "reason": result.get("reason", "")})
+                                    logger.info("Merged similar entities: '%s' + '%s' (reason: %s)",
+                                               node_a.name, node_b.name, result.get("reason", ""))
+                                except Exception as e:
+                                    logger.warning("Failed to merge similar entities: %s", e)
+
+                        except Exception as e:
+                            logger.warning("LLM call failed for similar entity detection: %s", e)
+                            llm_calls += 1  # Count failed calls too
+
+            if merged_count > 0:
+                logger.info("Similar entity detection: merged %d pairs (used %d LLM calls)",
+                           merged_count, llm_calls)
+
+            return merged_count
+
+        except Exception as e:
+            logger.error("Similar entity detection failed: %s", e)
+            return 0
+
+    async def _handle_orphan_nodes(self, tenant_id: str, user_id: str) -> int:
+        """
+        Handle orphan nodes (nodes with no relationships).
+        - Reminder nodes: connect to user
+        - Low importance + old: mark as dormant
+        - Others: keep (may be newly created)
+
+        Returns:
+            Number of nodes processed
+        """
+        try:
+            all_nodes = await self.graph.find_active_nodes(tenant_id, user_id)
+
+            orphans = []
+            for node in all_nodes:
+                rels = await self.graph.get_relations(node.id)
+                if not rels:
+                    orphans.append(node)
+
+            if not orphans:
+                return 0
+
+            processed_count = 0
+            now = datetime.utcnow()
+
+            # Find primary user node for connecting reminders
+            primary_nodes = await self.graph.find_nodes_by_name(PRIMARY_USER, tenant_id, user_id)
+            primary_user_id = primary_nodes[0].id if primary_nodes else None
+
+            for node in orphans:
+                # Check if it's a reminder
+                if "提醒" in node.tags and primary_user_id:
+                    try:
+                        relation = Relation(
+                            from_id=primary_user_id,
+                            to_id=node.id,
+                            type="HAS_REMINDER",
+                            description="系统自动连接的提醒",
+                            valid_from=now,
+                            source_session="consolidator-orphan-handler",
+                        )
+                        await self.graph.create_relation(relation)
+                        processed_count += 1
+                        logger.info("Connected orphan reminder '%s' to user", node.name)
+                    except Exception as e:
+                        logger.warning("Failed to connect reminder: %s", e)
+                    continue
+
+                # Check if it's low importance and old
+                if node.importance < 3.0:
+                    created_at = node.created_at
+                    if isinstance(created_at, str):
+                        try:
+                            created_at = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                            created_at = created_at.replace(tzinfo=None)
+                        except Exception:
+                            created_at = now
+                    elif not isinstance(created_at, datetime):
+                        created_at = now
+
+                    days_old = (now - created_at).days
+                    if days_old > 7:
+                        try:
+                            await self.graph.update_node(node.id, {"status": "dormant"})
+                            processed_count += 1
+                            logger.info("Marked old low-importance orphan '%s' as dormant", node.name)
+                        except Exception as e:
+                            logger.warning("Failed to mark orphan as dormant: %s", e)
+
+            if processed_count > 0:
+                logger.info("Orphan handler: processed %d orphan nodes", processed_count)
+
+            return processed_count
+
+        except Exception as e:
+            logger.error("Orphan node handling failed: %s", e)
+            return 0
+
+    async def _demote_low_value_nodes(self, tenant_id: str, user_id: str) -> int:
+        """
+        Demote low-value nodes by reducing their importance.
+        They will naturally decay to dormant status later.
+
+        Returns:
+            Number of nodes demoted
+        """
+        try:
+            import re
+
+            all_nodes = await self.graph.find_active_nodes(tenant_id, user_id)
+
+            demoted_count = 0
+
+            for node in all_nodes:
+                should_demote = False
+                new_importance = node.importance
+
+                # Check for pure numeric nodes
+                if re.match(r"^\d+大卡$", node.name) or re.match(r"^\d+kg$", node.name) or re.match(r"^\d+公里$", node.name):
+                    should_demote = True
+                    new_importance = 1.0
+
+                # Check for pure food nodes (without preference)
+                elif "食物" in node.tags and "偏好" not in node.tags:
+                    should_demote = True
+                    new_importance = 1.0
+
+                # Check for debug/technical detail nodes
+                elif node.summary and any(keyword in node.summary for keyword in ["调试", "排查", "测试"]):
+                    should_demote = True
+                    new_importance = 2.0
+
+                if should_demote and node.importance > new_importance:
+                    try:
+                        await self.graph.update_node(node.id, {"importance": new_importance})
+                        demoted_count += 1
+                        logger.info("Demoted low-value node '%s' from %.1f to %.1f",
+                                   node.name, node.importance, new_importance)
+                    except Exception as e:
+                        logger.warning("Failed to demote node '%s': %s", node.name, e)
+
+            if demoted_count > 0:
+                logger.info("Low-value demotion: demoted %d nodes", demoted_count)
+
+            return demoted_count
+
+        except Exception as e:
+            logger.error("Low-value node demotion failed: %s", e)
             return 0
