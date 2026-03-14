@@ -103,6 +103,13 @@ class Consolidator:
                         else:
                             stats["nodes_updated"] += 1
 
+                        # Handle interference: invalidate old relations if needed
+                        relations_to_invalidate = entity.get("relations_to_invalidate", [])
+                        if relations_to_invalidate:
+                            await self._invalidate_relations(
+                                node_id, relations_to_invalidate, tenant_id, user_id
+                            )
+
                 for rel_data in unit.get("relations", []):
                     if await self._upsert_relation(rel_data, name_to_id, tenant_id, user_id, unit):
                         stats["relations_created"] += 1
@@ -123,6 +130,13 @@ class Consolidator:
         patterns, conflicts = await self._discover_patterns(valid_units)
         stats["patterns_discovered"] = patterns
         stats["conflicts_found"] = conflicts
+
+        # Step 5.4: Resolve conflicts from interference detection
+        try:
+            conflicts_resolved = await self._resolve_conflicts(tenant_id, user_id)
+            stats["conflicts_resolved"] = conflicts_resolved
+        except Exception as e:
+            logger.warning("Conflict resolution failed: %s", e)
 
         # Step 5.5: Repair orphan nodes (suggest missing relations)
         try:
@@ -359,3 +373,138 @@ class Consolidator:
         if created:
             logger.info("Repaired %d orphan relationships", created)
         return created
+
+    # ------------------------------------------------------------------
+    # Interference handling
+    # ------------------------------------------------------------------
+
+    async def _invalidate_relations(
+        self,
+        node_id: str,
+        relation_types: List[str],
+        tenant_id: str,
+        user_id: str,
+    ) -> None:
+        """
+        标记指定类型的关系为无效（设置valid_until为当前时间）。
+
+        Args:
+            node_id: 节点ID
+            relation_types: 要失效的关系类型列表
+            tenant_id: 租户ID
+            user_id: 用户ID
+        """
+        try:
+            relations = await self.graph.get_relations(node_id)
+            now = datetime.utcnow()
+
+            for rel in relations:
+                # Check if this relation type should be invalidated
+                if rel.type in relation_types and rel.from_id == node_id:
+                    # Only invalidate outgoing relations (from this node)
+                    await self.graph.update_relation(
+                        rel.from_id, rel.to_id, rel.type,
+                        {"valid_until": now.isoformat()}
+                    )
+                    log_event("consolidation_interference",
+                             f"Invalidated relation {rel.type} from {node_id[:8]}",
+                             {"from": rel.from_id, "to": rel.to_id, "type": rel.type})
+                    logger.info("Invalidated relation %s: %s -> %s (interference)",
+                               rel.type, rel.from_id[:8], rel.to_id[:8])
+        except Exception as e:
+            logger.warning("Failed to invalidate relations for %s: %s", node_id, e)
+
+    async def _resolve_conflicts(self, tenant_id: str, user_id: str) -> int:
+        """
+        扫描并解决所有带冲突标记的节点。
+
+        Args:
+            tenant_id: 租户ID
+            user_id: 用户ID
+
+        Returns:
+            解决的冲突数量
+        """
+        try:
+            # Find all nodes with conflict markers
+            all_nodes = await self.graph.find_active_nodes(tenant_id, user_id)
+            conflict_nodes = [
+                n for n in all_nodes
+                if n.properties.get("_conflict_with")
+            ]
+
+            if not conflict_nodes:
+                return 0
+
+            resolved_count = 0
+            for node in conflict_nodes:
+                try:
+                    conflict_with = node.properties.get("_conflict_with")
+                    old_summary = node.properties.get("_conflict_old_summary", "")
+                    new_summary = node.properties.get("_conflict_new_summary", "")
+
+                    # Use LLM to decide how to resolve
+                    system_prompt = """\
+You are a conflict resolver for a memory system. Two pieces of information contradict each other.
+
+Decide how to resolve:
+1. "keep_new" - New information is correct, discard old
+2. "keep_old" - Old information is correct, discard new
+3. "keep_both" - Both are valid at different times, keep timeline
+4. "merge" - Merge both into a coherent statement
+
+Return ONLY valid JSON:
+{
+  "resolution": "keep_new" | "keep_old" | "keep_both" | "merge",
+  "reason": "brief explanation",
+  "merged_summary": "merged text if resolution=merge"
+}
+"""
+                    user_prompt = f"""Entity: {node.name}
+
+Old information: {old_summary}
+
+New information: {new_summary}
+
+How should we resolve this conflict?"""
+
+                    result = await call_llm_json(system_prompt, user_prompt, temperature=0.1)
+                    resolution = result.get("resolution", "keep_both")
+
+                    # Apply resolution
+                    updates = {}
+                    if resolution == "keep_new":
+                        # Keep new summary, clear conflict markers
+                        updates["summary"] = new_summary
+                    elif resolution == "keep_old":
+                        # Revert to old summary
+                        updates["summary"] = old_summary
+                    elif resolution == "keep_both":
+                        # Add timeline annotation
+                        updates["summary"] = f"{old_summary} [后更新为: {new_summary}]"
+                    elif resolution == "merge":
+                        # Use LLM-merged version
+                        updates["summary"] = result.get("merged_summary", new_summary)
+
+                    # Clear conflict markers
+                    new_props = {k: v for k, v in node.properties.items()
+                                if not k.startswith("_conflict_")}
+                    updates["properties"] = new_props
+
+                    await self.graph.update_node(node.id, updates)
+                    resolved_count += 1
+
+                    log_event("consolidation_conflict_resolved",
+                             f"Resolved conflict for {node.name}: {resolution}",
+                             {"node_id": node.id, "resolution": resolution})
+                    logger.info("Resolved conflict for %s: %s (%s)",
+                               node.name, resolution, result.get("reason"))
+
+                except Exception as e:
+                    logger.warning("Failed to resolve conflict for node %s: %s", node.id, e)
+
+            return resolved_count
+
+        except Exception as e:
+            logger.error("Conflict resolution scan failed: %s", e)
+            return 0
