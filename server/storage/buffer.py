@@ -80,6 +80,12 @@ class EncoderBuffer:
         """Create tables and indexes if they do not exist."""
         with self._conn() as conn:
             conn.executescript(_CREATE_TABLE_SQL)
+            # Add embedding column if not exists (v3.1 migration)
+            try:
+                conn.execute("SELECT embedding FROM memory_buffer LIMIT 1")
+            except sqlite3.OperationalError:
+                conn.execute("ALTER TABLE memory_buffer ADD COLUMN embedding BLOB")
+                logger.info("Added embedding column to memory_buffer")
         logger.debug("EncoderBuffer initialized at %s", self._db_path)
 
     @staticmethod
@@ -291,3 +297,24 @@ class EncoderBuffer:
                 (tenant_id, user_id),
             ).fetchall()
         return [self._row_to_unit(r) for r in rows]
+
+    # -------------------------------------------------------------------------
+    # Vector embedding support
+    # -------------------------------------------------------------------------
+
+    def update_embedding(self, unit_id: str, embedding_bytes: bytes) -> None:
+        """Store embedding for a buffer unit."""
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE memory_buffer SET embedding = ? WHERE id = ?",
+                (embedding_bytes, unit_id)
+            )
+
+    def get_embeddings(self, tenant_id: str, user_id: str) -> list:
+        """Get all non-archived units that have embeddings. Returns [(id, embedding_bytes)]."""
+        with self._conn() as conn:
+            cursor = conn.execute(
+                "SELECT id, embedding FROM memory_buffer WHERE tenant_id=? AND user_id=? AND archived=0 AND embedding IS NOT NULL",
+                (tenant_id, user_id)
+            )
+            return [(row["id"], row["embedding"]) for row in cursor.fetchall()]

@@ -90,6 +90,13 @@ async def lifespan(app: FastAPI):
     app.state.working_memory = WorkingMemory(graph, buffer)
     app.state.prospective_checker = ProspectiveChecker(graph)
 
+    # Ensure vector index exists
+    try:
+        await graph.ensure_vector_index()
+        logger.info("Vector index ready")
+    except Exception as e:
+        logger.warning("Failed to create vector index: %s", e)
+
     logger.info("All components initialized.")
     yield
 
@@ -471,3 +478,35 @@ async def check_prospective(req: CheckProspectiveRequest, request: Request):
     except Exception as exc:
         logger.exception("check-prospective failed: %s", exc)
         return JSONResponse(status_code=500, content=err(500, str(exc)))
+
+
+@app.post("/hooks/backfill-embeddings")
+async def backfill_embeddings(request: Request):
+    """One-time backfill: generate embeddings for all nodes that don't have one."""
+    try:
+        body = await request.json()
+        tenant_id = body.get("tenant_id", "default")
+        user_id = body.get("user_id", "yugo")
+
+        graph = request.app.state.graph
+        from server.engine.embedding_client import get_embeddings
+
+        nodes = await graph.find_nodes_without_embedding(tenant_id, user_id)
+        if not nodes:
+            return {"code": 0, "message": "success", "data": {"backfilled": 0, "message": "All nodes already have embeddings"}}
+
+        # Batch generate embeddings
+        texts = [f"{n['name']}: {n['summary'] or n['name']}" for n in nodes]
+        embeddings = await get_embeddings(texts, type_="db")
+
+        updated = 0
+        for node, emb in zip(nodes, embeddings):
+            if any(v != 0.0 for v in emb[:10]):
+                await graph.update_node_embedding(node["id"], emb)
+                updated += 1
+
+        log_event("backfill", f"Backfilled {updated}/{len(nodes)} node embeddings", {})
+        return {"code": 0, "message": "success", "data": {"backfilled": updated, "total": len(nodes)}}
+    except Exception as e:
+        logger.error("Backfill failed: %s", e)
+        return {"code": 1, "message": str(e)}

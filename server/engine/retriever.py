@@ -227,6 +227,48 @@ class Retriever:
         except Exception as e:
             logger.warning("Buffer retrieval failed: %s", e)
 
+        # Step 7.5: Vector semantic search (Path E)
+        try:
+            from server.engine.embedding_client import get_embedding
+            import numpy as np
+
+            query_embedding = await get_embedding(query, type_="query")
+            if any(v != 0.0 for v in query_embedding[:10]):  # not a zero vector
+                # E1: Neo4j vector search (long-term memory)
+                try:
+                    vector_hits = await self.graph.vector_search(query_embedding, top_k=5, min_score=0.5)
+                    for hit in vector_hits:
+                        node_data = hit["node"]
+                        nid = node_data.get("id", "")
+                        if nid and nid not in node_candidates:
+                            node_candidates[nid] = self._node_from_dict(node_data)
+                            logger.info("Vector search found node: %s (score=%.2f)", node_data.get("name"), hit["score"])
+                except Exception as e:
+                    logger.warning("Neo4j vector search failed: %s", e)
+
+                # E2: Buffer vector search (short-term memory, numpy brute force)
+                try:
+                    buf_embeddings = self.buffer.get_embeddings(tenant_id, user_id)
+                    if buf_embeddings:
+                        q_emb = np.array(query_embedding, dtype=np.float32)
+                        q_norm = np.linalg.norm(q_emb)
+                        if q_norm > 0:
+                            for buf_id, buf_emb_bytes in buf_embeddings:
+                                b_emb = np.frombuffer(buf_emb_bytes, dtype=np.float32)
+                                b_norm = np.linalg.norm(b_emb)
+                                if b_norm > 0:
+                                    score = float(np.dot(q_emb, b_emb) / (q_norm * b_norm))
+                                    if score > 0.5:
+                                        # Find the buffer unit and add if not already present
+                                        for bu in buffer_units:
+                                            if bu.get("id") == buf_id:
+                                                bu["_vector_score"] = score
+                                                break
+                except Exception as e:
+                    logger.warning("Buffer vector search failed: %s", e)
+        except ImportError:
+            pass  # embedding_client not available
+
         # Step 8: Score and rank
         scored = self._score_candidates(
             list(node_candidates.values()), buffer_units, query, entities, keywords, current_emotion

@@ -583,3 +583,57 @@ class GraphStore:
         """
         async with driver.session() as session:
             await session.run(query, node_id=node_id, new_tags=new_tags)
+
+    # ------------------------------------------------------------------
+    # Vector search methods
+    # ------------------------------------------------------------------
+
+    async def ensure_vector_index(self):
+        """Create vector index for MemoryNode embeddings if not exists."""
+        async with self.driver.session() as session:
+            result = await session.run(
+                "SHOW INDEXES YIELD name WHERE name = 'memory_embedding' RETURN count(*) as count"
+            )
+            record = await result.single()
+            if record and record["count"] > 0:
+                return
+            await session.run("""
+                CREATE VECTOR INDEX memory_embedding IF NOT EXISTS
+                FOR (n:MemoryNode) ON (n.embedding)
+                OPTIONS {indexConfig: {
+                    `vector.dimensions`: 1536,
+                    `vector.similarity_function`: 'cosine'
+                }}
+            """)
+            logger.info("Created vector index 'memory_embedding'")
+
+    async def update_node_embedding(self, node_id: str, embedding: list):
+        """Update the embedding property of a MemoryNode."""
+        async with self.driver.session() as session:
+            await session.run(
+                "MATCH (n:MemoryNode {id: $id}) SET n.embedding = $embedding",
+                id=node_id, embedding=embedding
+            )
+
+    async def vector_search(self, query_embedding: list, top_k: int = 10, min_score: float = 0.5) -> list:
+        """Vector similarity search on MemoryNodes."""
+        async with self.driver.session() as session:
+            result = await session.run("""
+                CALL db.index.vector.queryNodes('memory_embedding', $top_k, $embedding)
+                YIELD node, score
+                WHERE score >= $min_score AND node.status <> 'suppressed'
+                RETURN node, score
+                ORDER BY score DESC
+            """, top_k=top_k, embedding=query_embedding, min_score=min_score)
+            records = [r async for r in result]
+            return [{"node": dict(r["node"]), "score": r["score"]} for r in records]
+
+    async def find_nodes_without_embedding(self, tenant_id: str, user_id: str) -> list:
+        """Find all active nodes that don't have an embedding yet."""
+        async with self.driver.session() as session:
+            result = await session.run("""
+                MATCH (n:MemoryNode {tenant_id: $tid, user_id: $uid})
+                WHERE n.embedding IS NULL AND n.status = 'active'
+                RETURN n.id as id, n.name as name, n.summary as summary
+            """, tid=tenant_id, uid=user_id)
+            return [dict(r) async for r in result]
