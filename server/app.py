@@ -197,7 +197,7 @@ async def before_query(req: BeforeQueryRequest, request: Request):
 
         wm = wm_store.get(req.session_id)
         result = await retriever.retrieve(
-            req.query, req.tenant_id, req.user_id, wm, max_results=10
+            req.query, req.tenant_id, req.user_id, wm, max_results=10, session_id=req.session_id
         )
         memories = result.get("memories", [])
         log_event("hook_before_query", f"Query: {req.query[:80]}", {
