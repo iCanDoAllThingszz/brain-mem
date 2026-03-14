@@ -98,8 +98,9 @@ For "noise" or "command" types, rewrite should be null.
 Return ONLY valid JSON:
 {
   "type": "noise" | "command" | "informative",
-  "category": "cognition" | "log_diet" | "log_exercise" | "log_interview" | "log_trading" | "log_learning" | "log_general",
+  "category": "cognition" | "log_diet" | "log_exercise" | "log_interview" | "log_trading" | "log_learning" | "log_general" | "reconsolidation",
   "target_entity": "entity name that should be updated (e.g., '减肥计划', '跳槽计划')" | null,
+  "correction_type": "correct" | "supplement" | "reframe" | null,
   "reason": "one-sentence classification explanation",
   "rewrite": "rewritten high-density memory statement" | null
 }
@@ -120,9 +121,17 @@ Category rules:
 - "log_learning": ONLY actual study notes or learning records. E.g., "今天学了Rust的所有权机制". \
   NOT decisions to learn something (that's cognition).
 - "log_general": Other log-type information that doesn't fit above categories
+- "reconsolidation": User is correcting, supplementing, or reframing a PREVIOUS memory. \
+  This is memory reconsolidation — updating existing information based on new context. \
+  ALWAYS set target_entity to the entity being corrected. \
+  ALWAYS set correction_type: \
+    * "correct": Factual correction (e.g., "不对，我当时说的是感觉很好") \
+    * "supplement": Adding new information (e.g., "腾讯一面过了，下周二面") \
+    * "reframe": Emotional reinterpretation (e.g., "美团那段时间其实很痛苦")
 
 For log categories, ALWAYS set target_entity (use the defaults above if unsure).
-For cognition category or noise/command types, target_entity should be null.
+For reconsolidation category, ALWAYS set target_entity and correction_type.
+For cognition category or noise/command types, target_entity and correction_type should be null.
 """
 
 
@@ -145,8 +154,9 @@ class Perceiver:
         Returns:
             Dict with keys:
                 - "type": "noise" | "command" | "informative"
-                - "category": "cognition" | "log_*" — information category
-                - "target_entity": str | None — entity to update for log categories
+                - "category": "cognition" | "log_*" | "reconsolidation" — information category
+                - "target_entity": str | None — entity to update for log/reconsolidation categories
+                - "correction_type": str | None — "correct" | "supplement" | "reframe" for reconsolidation
                 - "reason": str
                 - "rewrite": str | None — high-density rewrite for informative messages
         """
@@ -169,20 +179,37 @@ class Perceiver:
             category = result.get("category", "cognition")
             valid_categories = {
                 "cognition", "log_diet", "log_exercise", "log_interview",
-                "log_trading", "log_learning", "log_general"
+                "log_trading", "log_learning", "log_general", "reconsolidation"
             }
             if category not in valid_categories:
                 logger.warning("Unexpected category '%s', defaulting to cognition", category)
                 category = "cognition"
 
             target_entity = result.get("target_entity")
+            correction_type = result.get("correction_type")
+
+            # Validate target_entity and correction_type based on category
             if msg_type != "informative" or category == "cognition":
                 target_entity = None
+                correction_type = None
+            elif category == "reconsolidation":
+                # Reconsolidation requires both target_entity and correction_type
+                if not target_entity:
+                    logger.warning("Reconsolidation missing target_entity, defaulting to cognition")
+                    category = "cognition"
+                    correction_type = None
+                elif correction_type not in {"correct", "supplement", "reframe"}:
+                    logger.warning("Invalid correction_type '%s', defaulting to 'correct'", correction_type)
+                    correction_type = "correct"
+            else:
+                # Other categories don't use correction_type
+                correction_type = None
 
             return {
                 "type": msg_type,
                 "category": category,
                 "target_entity": target_entity,
+                "correction_type": correction_type,
                 "reason": result.get("reason", ""),
                 "rewrite": rewrite,
             }
@@ -192,6 +219,7 @@ class Perceiver:
                 "type": "informative",
                 "category": "cognition",
                 "target_entity": None,
+                "correction_type": None,
                 "reason": f"classification error: {e}",
                 "rewrite": None
             }
