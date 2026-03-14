@@ -2,7 +2,7 @@ import os
 import uuid
 import logging
 from contextlib import asynccontextmanager
-from typing import Optional, Any
+from typing import Optional, Any, Dict
 
 from fastapi import FastAPI, BackgroundTasks, Request
 from fastapi.responses import JSONResponse
@@ -101,6 +101,10 @@ async def lifespan(app: FastAPI):
 # App
 # ---------------------------------------------------------------------------
 app = FastAPI(title="Brain Memory Service", version="0.1.0", lifespan=lifespan)
+
+# Session message counters for intermediate summaries
+_session_msg_counts: Dict[str, int] = {}
+_SESSION_SUMMARY_INTERVAL = 10  # Generate summary every N messages
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +263,24 @@ async def _process_after_response(
     wm_store: WorkingMemory,
 ):
     try:
+        # Increment session message counter for intermediate summaries
+        global _session_msg_counts
+        _session_msg_counts[session_id] = _session_msg_counts.get(session_id, 0) + 1
+        msg_count = _session_msg_counts[session_id]
+
+        # Trigger intermediate summary every N messages
+        if msg_count % _SESSION_SUMMARY_INTERVAL == 0:
+            logger.info("Triggering intermediate summary for session %s (msg_count=%d)", session_id, msg_count)
+            try:
+                # Generate summary with empty conversation history (will use buffer contents)
+                await encoder.generate_session_summary([], tenant_id, user_id, session_id)
+                log_event("intermediate_summary", f"Generated intermediate summary for session {session_id[:8]}", {
+                    "session_id": session_id,
+                    "message_count": msg_count,
+                })
+            except Exception as e:
+                logger.warning("Intermediate summary generation failed: %s", e)
+
         wm = wm_store.get(session_id)
         perception = await perceiver.classify(user_message, wm)
         msg_type = perception.get("type")
@@ -354,6 +376,12 @@ async def _process_session_end(
             conversation_history, tenant_id, user_id, session_id
         )
         wm_store.destroy(session_id)
+
+        # Clean up session message counter
+        global _session_msg_counts
+        if session_id in _session_msg_counts:
+            del _session_msg_counts[session_id]
+
         logger.info("session-end completed | session=%s", session_id)
     except Exception as exc:
         logger.exception("session-end background task failed: %s", exc)
