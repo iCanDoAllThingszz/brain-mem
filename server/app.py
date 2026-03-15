@@ -104,10 +104,20 @@ async def lifespan(app: FastAPI):
     await graph.close()
 
 
+from fastapi.middleware.cors import CORSMiddleware
+
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 app = FastAPI(title="Brain Memory Service", version="0.1.0", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow frontend dev server
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Session message counters for intermediate summaries
 _session_msg_counts: Dict[str, int] = {}
@@ -152,6 +162,26 @@ class CheckProspectiveRequest(BaseModel):
     user_id: str
 
 
+class CreateNodeRequest(BaseModel):
+    tenant_id: str
+    user_id: str
+    name: str
+    summary: str = ""
+    zone: str = "episodic"
+    importance: int = 5
+    tags: list[str] = []
+    properties: dict[str, Any] = {}
+
+
+class CreateRelationRequest(BaseModel):
+    tenant_id: str
+    user_id: str
+    from_id: str
+    to_id: str
+    rel_type: str
+    properties: dict[str, Any] = {}
+
+
 def ok(data: Any) -> dict:
     return {"code": 0, "message": "success", "data": data}
 
@@ -179,9 +209,98 @@ async def health():
 
 
 @app.get("/logs")
-async def get_logs(n: int = 30):
+async def get_logs(n: int = 100):
     """View recent activity logs."""
     return {"logs": read_recent(n)}
+
+
+# --- Graph Management API ---
+
+@app.get("/api/graph")
+async def get_graph(tenant_id: str = "default", user_id: str = "yugo", limit: int = 300, request: Request = None):
+    """Get graph nodes and relations for visualization."""
+    try:
+        graph = request.app.state.graph
+        data = await graph.get_all_graph_data(tenant_id, user_id, limit=limit)
+        return ok(data)
+    except Exception as exc:
+        logger.exception("get_graph failed: %s", exc)
+        return JSONResponse(status_code=500, content=err(500, str(exc)))
+
+
+@app.post("/api/graph/node")
+async def create_node(req: CreateNodeRequest, request: Request):
+    """Create a new memory node."""
+    try:
+        from server.models.node import Node
+        graph = request.app.state.graph
+        new_node = Node(
+            id=str(uuid.uuid4()),
+            name=req.name,
+            summary=req.summary,
+            zone=req.zone,
+            importance=req.importance,
+            tags=req.tags,
+            properties=req.properties,
+        )
+        created = await graph.create_node(new_node, req.tenant_id, req.user_id)
+        return ok({"node_id": created.id})
+    except Exception as exc:
+        logger.exception("create_node failed: %s", exc)
+        return JSONResponse(status_code=500, content=err(500, str(exc)))
+
+
+@app.delete("/api/graph/node/{node_id}")
+async def delete_node(node_id: str, tenant_id: str = "default", user_id: str = "yugo", request: Request = None):
+    """Delete a node and its relations."""
+    try:
+        graph = request.app.state.graph
+        deleted = await graph.delete_node_and_relations(node_id, tenant_id, user_id)
+        if deleted:
+            return ok({"deleted": True})
+        return err(404, "Node not found")
+    except Exception as exc:
+        logger.exception("delete_node failed: %s", exc)
+        return JSONResponse(status_code=500, content=err(500, str(exc)))
+
+
+@app.post("/api/graph/relation")
+async def create_relation(req: CreateRelationRequest, request: Request):
+    """Create a new relation between notes."""
+    try:
+        from server.models.relation import Relation
+        graph = request.app.state.graph
+        rel = Relation(
+            from_id=req.from_id,
+            to_id=req.to_id,
+            type=req.rel_type,
+            properties=req.properties
+        )
+        created = await graph.create_relation(rel)
+        return ok({
+            "from_id": created.from_id, 
+            "to_id": created.to_id, 
+            "type": created.type
+        })
+    except ValueError as exc:
+         return err(404, str(exc))
+    except Exception as exc:
+        logger.exception("create_relation failed: %s", exc)
+        return JSONResponse(status_code=500, content=err(500, str(exc)))
+
+
+@app.delete("/api/graph/relation")
+async def delete_relation(from_id: str, to_id: str, rel_type: str, tenant_id: str = "default", user_id: str = "yugo", request: Request = None):
+    """Delete a relation."""
+    try:
+        graph = request.app.state.graph
+        deleted = await graph.delete_relation(from_id, to_id, rel_type, tenant_id, user_id)
+        if deleted:
+             return ok({"deleted": True})
+        return err(404, "Relation not found")
+    except Exception as exc:
+        logger.exception("delete_relation failed: %s", exc)
+        return JSONResponse(status_code=500, content=err(500, str(exc)))
 
 
 @app.post("/hooks/session-start")

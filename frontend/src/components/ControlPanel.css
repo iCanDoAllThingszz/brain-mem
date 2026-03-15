@@ -1,0 +1,96 @@
+.control-panel {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.tabs-header {
+  display: flex;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.tab-btn {
+  flex: 1;
+  padding: 12px;
+  font-size: 14px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 8px;
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.tab-btn:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.tab-btn.border-left {
+  border-left: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.tab-btn.active {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.tab-btn.active.add { color: var(--primary-color); }
+.tab-btn.active.delete { color: var(--accent-color); }
+.tab-btn.active.rel { color: var(--secondary-color); }
+
+.tab-content {
+  padding: 16px;
+}
+
+.form-group {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.select-styled {
+  appearance: none;
+  background-image: url("data:image/svg+xml;charset=US-ASCII,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%22292.4%22%20height%3D%22292.4%22%3E%3Cpath%20fill%3D%22%2394a3b8%22%20d%3D%22M287%2069.4a17.6%2017.6%200%200%200-13-5.4H18.4c-5%200-9.3%201.8-12.9%205.4A17.6%2017.6%200%200%200%200%2082.2c0%205%201.8%209.3%205.4%2012.9l128%20127.9c3.6%203.6%207.8%205.4%2012.8%205.4s9.2-1.8%2012.8-5.4L287%2095c3.5-3.5%205.4-7.8%205.4-12.8%200-5-1.9-9.2-5.5-12.8z%22%2F%3E%3C%2Fsvg%3E");
+  background-repeat: no-repeat, repeat;
+  background-position: right .7em top 50%, 0 0;
+  background-size: .65em auto, 100%;
+}
+
+.btn-primary { justify-content: center; background: rgba(79, 70, 229, 0.2); color: var(--primary-color); border-color: rgba(79, 70, 229, 0.5); }
+.btn-primary:hover { background: rgba(79, 70, 229, 0.3); }
+
+.input-accent:focus { border-color: rgba(244, 63, 94, 0.5); box-shadow: 0 0 0 1px rgba(244, 63, 94, 0.5); }
+.btn-accent { justify-content: center; background: rgba(244, 63, 94, 0.2); color: var(--accent-color); border-color: rgba(244, 63, 94, 0.5); }
+.btn-accent:hover { background: rgba(244, 63, 94, 0.3); }
+
+.input-secondary:focus { border-color: rgba(6, 182, 212, 0.5); box-shadow: 0 0 0 1px rgba(6, 182, 212, 0.5); }
+.btn-secondary { justify-content: center; background: rgba(6, 182, 212, 0.2); color: var(--secondary-color); border-color: rgba(6, 182, 212, 0.5); }
+.btn-secondary:hover { background: rgba(6, 182, 212, 0.3); }
+
+.warning-text {
+  font-size: 12px;
+  color: rgba(148, 163, 184, 0.7);
+  display: flex;
+  align-items: flex-start;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+.warning-icon {
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.status-message {
+  font-size: 12px;
+  font-family: 'Fira Code', monospace;
+  text-align: center;
+  padding: 4px;
+  margin-top: 8px;
+  background: rgba(0, 0, 0, 0.2);
+  border-radius: 4px;
+  color: var(--text-dim);
+  animation: pulse-slow 2s infinite;
+}

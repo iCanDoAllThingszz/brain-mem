@@ -628,12 +628,95 @@ class GraphStore:
             records = [r async for r in result]
             return [{"node": dict(r["node"]), "score": r["score"]} for r in records]
 
-    async def find_nodes_without_embedding(self, tenant_id: str, user_id: str) -> list:
-        """Find all active nodes that don't have an embedding yet."""
-        async with self._driver.session() as session:
-            result = await session.run("""
-                MATCH (n:MemoryNode {tenant_id: $tid, user_id: $uid})
-                WHERE n.embedding IS NULL AND n.status = 'active'
-                RETURN n.id as id, n.name as name, n.summary as summary
-            """, tid=tenant_id, uid=user_id)
-            return [dict(r) async for r in result]
+    async def get_all_graph_data(self, tenant_id: str, user_id: str, limit: int = 300) -> Dict[str, Any]:
+        """
+        Fetch nodes and relationships for graph visualization up to a limit.
+        """
+        driver = self._ensure_connected()
+        query = """
+        MATCH (n:MemoryNode {tenant_id: $tenant_id, user_id: $user_id})
+        WITH n ORDER BY n.updated_at DESC LIMIT $limit
+        OPTIONAL MATCH (n)-[r]->(m:MemoryNode)
+        WHERE m.tenant_id = $tenant_id AND m.user_id = $user_id
+        RETURN n AS node, r AS relation, m AS target
+        """
+        async with driver.session() as session:
+            result = await session.run(query, tenant_id=tenant_id, user_id=user_id, limit=limit)
+            
+            nodes_dict = {}
+            relations = []
+            
+            async for r in result:
+                # Add node
+                node_data = r["node"]
+                if node_data:
+                    node_props = dict(node_data)
+                    node_id = node_props.get("id")
+                    if node_id and node_id not in nodes_dict:
+                        nodes_dict[node_id] = node_props
+                
+                # Add relation and target if they exist
+                rel_data = r.get("relation")
+                target_data = r.get("target")
+                
+                if rel_data and target_data:
+                    rel_type = rel_data.type
+                    rel_props = dict(rel_data)
+                    target_props = dict(target_data)
+                    target_id = target_props.get("id")
+                    
+                    if target_id and target_id not in nodes_dict:
+                        nodes_dict[target_id] = target_props
+                        
+                    relations.append({
+                        "from_id": node_id,
+                        "to_id": target_id,
+                        "rel_type": rel_type,
+                        "rel_props": rel_props
+                    })
+            
+            # De-duplicate relations just in case
+            unique_relations = []
+            seen_rels = set()
+            for rel in relations:
+                # Basic signature for unique relations
+                sig = f"{rel['from_id']}-{rel['to_id']}-{rel['rel_type']}"
+                if sig not in seen_rels:
+                    seen_rels.add(sig)
+                    unique_relations.append(rel)
+                    
+            return {
+                "nodes": list(nodes_dict.values()),
+                "relations": unique_relations
+            }
+
+    async def delete_node_and_relations(self, node_id: str, tenant_id: str, user_id: str) -> bool:
+        """
+        Delete a node and all its relationships (DETACH DELETE).
+        """
+        driver = self._ensure_connected()
+        query = """
+        MATCH (n:MemoryNode {id: $node_id, tenant_id: $tenant_id, user_id: $user_id})
+        DETACH DELETE n
+        RETURN count(n) AS deleted
+        """
+        async with driver.session() as session:
+            result = await session.run(query, node_id=node_id, tenant_id=tenant_id, user_id=user_id)
+            record = await result.single()
+            return record and record["deleted"] > 0
+
+    async def delete_relation(self, from_id: str, to_id: str, rel_type: str, tenant_id: str, user_id: str) -> bool:
+        """
+        Delete a specific relationship between two nodes.
+        """
+        driver = self._ensure_connected()
+        cypher_type = rel_type.upper().replace(" ", "_")
+        query = f"""
+        MATCH (a:MemoryNode {{id: $from_id, tenant_id: $tenant_id, user_id: $user_id}})-[r:{cypher_type}]->(b:MemoryNode {{id: $to_id, tenant_id: $tenant_id, user_id: $user_id}})
+        DELETE r
+        RETURN count(r) AS deleted
+        """
+        async with driver.session() as session:
+            result = await session.run(query, from_id=from_id, to_id=to_id, tenant_id=tenant_id, user_id=user_id)
+            record = await result.single()
+            return record and record["deleted"] > 0
