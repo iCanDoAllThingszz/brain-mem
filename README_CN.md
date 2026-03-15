@@ -1,268 +1,390 @@
-<div align="center">
+<p align="center">
+  <h1 align="center">🧠 Brain-Mem</h1>
+  <p align="center"><strong>基于认知科学的 AI Agent 记忆系统</strong></p>
+</p>
 
-# 🧠 Brain-Mem
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.11+-blue.svg" alt="Python">
+  <img src="https://img.shields.io/badge/Neo4j-5.x-008CC1.svg" alt="Neo4j">
+  <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License">
+  <img src="https://img.shields.io/badge/FastAPI-0.100+-009688.svg" alt="FastAPI">
+</p>
 
-**基于认知科学的 AI Agent 记忆系统**
-
-*不只是存储——一个会编码、遗忘、做梦、成长的大脑。*
-
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Python 3.11+](https://img.shields.io/badge/Python-3.11+-green.svg)](https://python.org)
-[![Neo4j 5.x](https://img.shields.io/badge/Neo4j-5.x-008CC1.svg)](https://neo4j.com)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-009688.svg)](https://fastapi.tiangolo.com)
-
-[English](README.md) | **中文**
-
-</div>
+<p align="center">
+  <a href="README.md">English</a> | <strong>中文</strong>
+</p>
 
 ---
 
+Brain-Mem 模拟人脑处理、存储、巩固和检索记忆的完整过程，为 AI Agent 提供一套生产级记忆服务。不同于简单的键值存储或向量检索，Brain-Mem 忠实映射了认知科学中的核心机制：选择性编码、睡眠巩固、自然遗忘、情绪共鸣、前瞻性记忆。
+
 ## 为什么需要 Brain-Mem？
 
-大多数 AI 记忆系统本质上是美化的键值存储：存一切、按关键词检索、完事。
+大多数 AI Agent 记忆系统把记忆当作扁平数据库：存一切，按相似度检索。但人脑的工作方式完全不同：
 
-人类记忆不是这样工作的。我们**选择性编码**重要信息、用**情绪加权**体验、在**睡眠中巩固**记忆、**自然遗忘**不重要的事、还能**创造性重组**碎片产生新洞察。
+- **不是所有信息都会被存储** — 大脑主动过滤和评估输入信息
+- **记忆在睡眠中巩固** — 重要记忆增强，琐碎记忆衰退
+- **检索是多通路的** — 你可以通过名字、联想、情绪、上下文回忆事物
+- **遗忘是特性而非缺陷** — 防止信息过载，保持记忆的时效性
+- **未来意图会持久化** — "X发生时提醒我做Y"是真实的记忆类型
 
-Brain-Mem 将这些认知科学原理带给 AI Agent：
+Brain-Mem 实现了以上所有机制。
 
-| 能力 | 认知科学基础 | 作用 |
-|:-----|:-----------|:-----|
-| 选择性编码 | 海马体门控 | 只编码新颖、相关的信息——噪声直接丢弃 |
-| 情绪共鸣 | 心境一致性记忆 | 悲伤语境？检索共情记忆 + 鼓励性记忆 |
-| 睡眠巩固 | 记忆巩固理论 | 每夜定时去重、发现模式、生成洞察 |
-| 自然遗忘 | 艾宾浩斯曲线 | 不重要的记忆衰减；重要的通过间隔重复保持 |
-| 记忆重巩固 | 记忆更新理论 | "其实那次面试还不错" → 原地修正已存储的记忆 |
-| 前瞻性记忆 | 未来意图 | 时间/事件触发器："下次聊到 X 时提醒我 Y" |
-| 创造性重组 | REM 睡眠做梦 | 随机记忆碎片组合 → 偶尔产生有价值的新洞察 |
-| 向量检索 | 语义相似度 | 图遍历 + 向量搜索混合检索，召回更鲁棒 |
-
-## 架构
+## 架构：大脑 ↔ 系统映射
 
 ```
-用户消息
-  │
-  ▼
-┌──────────┐    ┌──────────┐    ┌──────────┐
-│ 感知器   │───▶│ 评估器   │───▶│ 编码器   │
-│ (丘脑)   │    │(前额叶)  │    │(海马体)  │
-└──────────┘    └──────────┘    └────┬─────┘
- 分类 & 改写     评分新颖度          │ 实体 + 关系
-                 & 相关度            │
-                                    ▼
-                             ┌─────────────┐   每夜巩固   ┌─────────────┐
-                             │   缓冲区    │────────────▶│  巩固器     │
-                             │  (SQLite)   │             │  (睡眠)     │
-                             └─────────────┘             └──────┬──────┘
-                                    ▲                           │
-                                    │                           ▼
-                             ┌─────────────┐             ┌─────────────┐
-                             │   检索器    │◀───────────▶│   Neo4j     │
-                             │ (多路径)    │  图 + 向量   │  (长期记忆)  │
-                             └─────────────┘             └─────────────┘
+                    ┌─────────────────────────────────────────────┐
+                    │              输入消息                         │
+                    └──────────────────┬──────────────────────────┘
+                                       │
+                    ┌──────────────────▼──────────────────────────┐
+                    │  👁️ 感知器 Perceiver（感觉皮层 + 丘脑）      │
+                    │  过滤噪音，分类信息，结构化改写               │
+                    │  路由：认知 → 图谱 | 日志 → 文件              │
+                    └──────────────────┬──────────────────────────┘
+                                       │
+                    ┌──────────────────▼──────────────────────────┐
+                    │  🧪 评估器 Evaluator（前额叶 + 杏仁核）      │
+                    │  评估记忆价值：重要性、新颖性、情绪显著性     │
+                    │  决定是否进入长期记忆                         │
+                    └──────────────────┬──────────────────────────┘
+                                       │
+                    ┌──────────────────▼──────────────────────────┐
+                    │  🏗️ 编码器 Encoder（海马体）                  │
+                    │  实体生命周期管理：创建 / 合并 / 更新          │
+                    │  代词消解，去重，自动生成向量嵌入              │
+                    └──────┬───────────────────────┬──────────────┘
+                           │                       │
+              ┌────────────▼─────────┐  ┌─────────▼──────────────┐
+              │  📊 知识图谱          │  │  📝 文件日志            │
+              │  (Neo4j + 向量索引)  │  │  饮食/运动/交易/面试    │
+              │  目标、决策、关系     │  │  详细的每日记录          │
+              └────────────┬─────────┘  └─────────┬──────────────┘
+                           │                       │
+              ┌────────────▼───────────────────────▼──────────────┐
+              │  💤 巩固器 Consolidator（睡眠巩固）                │
+              │  间隔重复、创造性重组、图谱清洁、干扰遗忘          │
+              │  每日定时执行（cron）                               │
+              └───────────────────────────────────────────────────┘
+
+              ┌───────────────────────────────────────────────────┐
+              │  🔍 检索器 Retriever（多通路召回）                  │
+              │  5种策略：精确 → 别名 → 模糊 → 休眠唤醒 → 向量语义│
+              │  情绪共鸣加权 + 检索失败补偿                       │
+              └───────────────────────────────────────────────────┘
+
+              ┌───────────────────────────────────────────────────┐
+              │  🎯 工作记忆 Working Memory（会话上下文）           │
+              │  活跃目标、待触发提醒、情绪基线                    │
+              └───────────────────────────────────────────────────┘
+
+              ┌───────────────────────────────────────────────────┐
+              │  ⏰ 前瞻检查器 Prospective Checker（未来记忆）     │
+              │  基于时间和事件的触发器                             │
+              └───────────────────────────────────────────────────┘
 ```
 
-**核心管线：** 感知器 → 评估器 → 编码器 → 缓冲区 → 巩固器 → 知识图谱
 
-**检索策略：** 5 路径（精确匹配 → 别名 → 模糊 → 休眠节点 → 向量语义）
+## 组件详解
 
-**分层存储：** 按信息类型路由到不同存储：
+| 脑区 | 组件 | 文件 | 功能 |
+|---|---|---|---|
+| 感觉皮层 + 丘脑 | **感知器 Perceiver** | `perceiver.py` | 过滤噪音（寒暄、指令），将信息分类为认知型或日志型，结构化改写原始消息 |
+| 前额叶 + 杏仁核 | **评估器 Evaluator** | `evaluator.py` | 深度评估记忆价值，打分维度：重要性、新颖性、情绪显著性。日志类信息自动通过 |
+| 海马体 | **编码器 Encoder** | `encoder.py` | LLM驱动的实体生命周期管理：基于标签分组检索同类实体，一次LLM调用决定创建/合并/更新 |
+| 短期缓冲区 | **缓冲区 Buffer** | `buffer.py` | 基于SQLite的临时存储，支持向量嵌入，在巩固前暂存近期记忆 |
+| 睡眠巩固 | **巩固器 Consolidator** | `consolidator.py` | 每日批处理：间隔重复调度（1→3→7→21天）、创造性重组、LLM驱动的图谱清洁 |
+| 记忆检索 | **检索器 Retriever** | `retriever.py` | 5通路检索 + 情绪共鸣加权 + 检索失败补偿，将检索到的记忆片段合成为事实性上下文 |
+| 工作记忆 | **工作记忆 Working Memory** | `working_memory.py` | 会话级上下文缓存：活跃目标、待触发提醒、情绪基线 |
+| 前瞻性记忆 | **前瞻检查器 Prospective Checker** | `prospective_checker.py` | 面向未来的记忆：基于时间（"下午3点提醒"）和基于事件（"X发生时提醒"）的触发器 |
+| 嵌入系统 | **嵌入客户端 Embedding Client** | `embedding_client.py` | 异步向量生成 + LRU缓存（1000条），驱动向量语义检索 |
+| 日志系统 | **日志写入器 Log Writer** | `log_writer.py` | 按类别写入文件日志（饮食/运动/面试/交易/学习），同时维护图谱索引指针 |
 
-| 输入 | 分类 | 存储位置 |
-|:----|:-----|:--------|
-| "我决定跳槽" | `cognition` | 知识图谱（实体 + 关系） |
-| "中午吃了沙拉300大卡" | `log_diet` | Markdown 文件 + 缓冲区索引 |
-| "跑了5公里" | `log_exercise` | Markdown 文件 + 缓冲区索引 |
-| "不对，面试其实很好" | `reconsolidation` | 图谱更新（修正已有节点） |
-| "明天提醒我开会" | `prospective` | 图谱（触发器节点） |
-| "忘掉这个人" | `forget` | 图谱（节点抑制，不再检索） |
-| "嗯嗯" | `noise` | 丢弃 |
+## 核心特性
 
-## 快速开始
+### 1. 分层存储（v3 架构）
 
-### 方式 A：Docker Compose（推荐）
+大脑不会用存储人生决策的方式来存储购物清单。Brain-Mem 也是如此。
 
-一条命令启动全套：
+- **知识图谱（Neo4j）** — 高层认知：目标、决策、人际关系、里程碑、洞察
+- **文件系统** — 详细日志：饮食记录、运动日志、面试笔记、交易记录、学习日志
+- **图谱 ↔ 文件关联** — 图谱节点通过 `log_path` 指向日志文件，支持从认知下钻到细节
+- **效果**：图谱保持干净和有意义，不会被"苹果"、"牛肉面"等食物实体污染
 
-```bash
-git clone https://github.com/iCanDoAllThingszz/brain-mem.git
-cd brain-mem
-cp config.yaml.example config.yaml
-# 编辑 config.yaml，填入你的 LLM API key
-docker compose up -d
+```
+用户："早上我吃了一个苹果"
+
+❌ 没有分层存储：
+   → 创建实体：苹果、用户、早餐水果习惯
+   → 图谱被食物条目污染
+
+✅ 有分层存储：
+   → 追加到 memory/logs/diet/2026-03-14.md："- 早餐：苹果"
+   → 更新图谱：减肥计划.last_diet_log = "2026-03-14"
+   → 图谱保持干净，细节保存在文件中
 ```
 
-搞定。试试 demo：
+### 2. 智能编码（实体生命周期管理）
 
-```bash
-pip install httpx
-python demo.py
-```
+编码器不会盲目创建新节点，而是遵循严格的生命周期：
 
-### 方式 B：手动安装
+1. **标签分组** — 按语义标签对实体分类
+2. **同类检索** — 搜索具有匹配标签的现有节点
+3. **LLM决策** — 一次LLM调用决定：`create`（新建）、`merge`（合并到已有）、`update`（更新已有）
+4. **代词消解** — "我" → 实际用户名（硬编码兜底 + LLM驱动）
+5. **嵌入生成** — 编码时自动生成向量嵌入
 
-#### 环境要求
+预算：**每次编码操作仅1次LLM调用** — 高效设计。
 
-- Python 3.11+
-- Neo4j 5.x
-- 任意 OpenAI 兼容的 LLM API
+### 3. 多通路检索（5种策略）
 
-```bash
-git clone https://github.com/iCanDoAllThingszz/brain-mem.git
-cd brain-mem
-pip install -r requirements.txt
+人类的记忆检索不是单一机制。你可能通过名字、联想或模糊的感觉回忆起某件事。Brain-Mem 实现了5条检索通路：
 
-# 启动 Neo4j
-docker run -d --name neo4j-memory \
-  -p 7474:7474 -p 7687:7687 \
-  -e NEO4J_AUTH=neo4j/your-password \
-  neo4j:5
+| 通路 | 策略 | 适用场景 |
+|---|---|---|
+| A | **精确名称匹配** | 直接实体查找 |
+| B | **别名匹配** | "那个AI项目" → 匹配某个命名项目的别名 |
+| C | **模糊关键词搜索** | 部分匹配、相关词汇 |
+| D | **休眠节点唤醒** | 重新激活长期未访问的节点 |
+| E | **向量语义搜索** | 基于语义的嵌入检索 |
 
-# 配置
-cp config.yaml.example config.yaml
-# 编辑 config.yaml，填入 Neo4j 密码和 LLM API key
+附加机制：
+- **情绪共鸣** — 非中性情绪动态调整评分权重（相关性×0.4 + 情绪×0.2，而非默认的×0.5 / ×0.1）
+- **检索失败补偿** — 初始搜索结果不足时，自动扩展到3跳图遍历
+- **多跳遍历** — 默认1-2跳，补偿时扩展
 
-# 运行
-python -m uvicorn server.app:app --host 0.0.0.0 --port 8100
-```
 
-### 配置每夜巩固
+### 4. 认知科学特性
 
-```bash
-# 每天凌晨 1:00 执行巩固
-(crontab -l 2>/dev/null; echo "0 1 * * * curl -s -X POST http://localhost:8100/hooks/consolidate \
-  -H 'Content-Type: application/json' \
-  -d '{\"tenant_id\":\"default\",\"user_id\":\"your-user\"}'") | crontab -
-```
+这些不是噱头 — 每一项都映射到真实的认知机制，并有具体的工程实现：
 
-### 运行 Demo
+| 机制 | 脑科学基础 | 实现方式 |
+|---|---|---|
+| **间隔重复** | 艾宾浩斯遗忘曲线 | 复习间隔：1→3→7→21天，之后翻倍。巩固器根据访问模式调度下次复习 |
+| **创造性重组** | 睡眠期洞察生成 | 巩固期间，LLM发现记忆之间的非显性关联（最多2次尝试，temperature=0.7，置信度≥0.5） |
+| **记忆再巩固** | 回忆时的记忆更新 | 用户纠正自动更新已有记忆，无需评估门控。目标实体不存在时自动创建 |
+| **干扰遗忘** | 竞争性记忆痕迹 | 相似记忆自然竞争，较弱的痕迹在更强替代品存在时加速衰退 |
+| **自然衰减** | 基于时间的遗忘 | 未使用的记忆通过 `decay_factor` 逐渐降低检索强度，保持记忆的时效性 |
+| **情绪共鸣** | 杏仁核调节 | 带情绪标签的记忆获得检索优先级，非中性情绪动态调整评分权重 |
+| **前瞻性记忆** | 未来意图编码 | 基于时间（"下午3点提醒"）和基于事件（"X发生时提醒"）的触发器，直接写入图谱 |
+| **动机性遗忘** | 抑制机制 | 节点可被抑制（隐藏但不删除）— 可恢复，但退出主动检索 |
 
-`demo.py` 演示完整管线——编码不同类型的消息并检索记忆：
+### 5. LLM驱动的图谱清洁
 
-```bash
-python demo.py --base-url http://localhost:8100
-```
+保持知识图谱的整洁很难。Brain-Mem 用LLM智能替代脆弱的硬编码规则：
+
+- **巩固器批量审查**图谱节点（每批最多30个节点，每次巩固最多3次LLM调用）
+- **决策类型**：合并重复、抑制噪音、保留不确定
+- **反误杀优先**：当LLM返回"不确定"时 → **始终保留节点**。误删比冗余更糟糕。
+- **唯一的硬编码规则**：代词 → 用户名映射。其他一切由LLM决定。
+
+### 6. 工作记忆
+
+每个对话会话拥有独立的工作记忆上下文：
+
+- **活跃目标** — 用户当前正在推进的事项
+- **待触发提醒** — 等待激活的前瞻性记忆触发器
+- **情绪基线** — 当前情绪状态，用于共鸣评分
+- 在 `session-start` 时加载，为感知器、评估器和检索器提供上下文
+
+### 7. 向量检索
+
+基于 Neo4j 5.x 原生向量索引构建 — 无需额外的向量数据库：
+
+- **图谱节点**：1536维嵌入的余弦相似度搜索
+- **缓冲区记录**：Numpy暴力余弦计算（<1000条时最优，无ANN开销）
+- **向量字段组合**：图谱使用 `"name: summary"` 拼接；缓冲区使用感知器改写文本
+- **自动生成**：编码时创建嵌入；提供回填端点处理已有节点
+
+## 与其他系统的对比
+
+| 特性 | Brain-Mem | mem0 | Letta (MemGPT) |
+|---|:---:|:---:|:---:|
+| 认知科学架构 | ✅ 完整管线 | ❌ | ❌ |
+| 知识图谱存储 | ✅ Neo4j | ❌ 键值存储 | ❌ |
+| 分层存储（图谱+文件） | ✅ | ❌ | ❌ |
+| 多通路检索（5种策略） | ✅ | ❌ 仅相似度 | ❌ 仅相似度 |
+| 向量语义搜索 | ✅ Neo4j原生 | ✅ | ✅ |
+| 睡眠巩固 | ✅ 每日定时 | ❌ | ❌ |
+| 间隔重复 | ✅ Anki风格 | ❌ | ❌ |
+| 创造性重组 | ✅ LLM驱动 | ❌ | ❌ |
+| 情绪共鸣 | ✅ 动态权重 | ❌ | ❌ |
+| 前瞻性记忆 | ✅ 时间+事件触发 | ❌ | ❌ |
+| 自然遗忘/衰减 | ✅ | ❌ | ❌ |
+| 记忆再巩固 | ✅ | ❌ | ❌ |
+| 实体生命周期管理 | ✅ LLM驱动 | ❌ | ❌ |
+| 图谱自动清洁 | ✅ LLM驱动 | ❌ | ❌ |
+| 工作记忆（会话级） | ✅ | ❌ | ✅ |
+| 多租户支持 | ✅ | ✅ | ❌ |
+
 
 ## API 参考
 
-### Hooks（集成接口）
+| 端点 | 方法 | 描述 |
+|---|---|---|
+| `/health` | GET | 健康检查和版本信息 |
+| `/logs` | GET | 查看最近活动日志（`?n=50`） |
+| `/hooks/session-start` | POST | 初始化会话，加载工作记忆 |
+| `/hooks/before-query` | POST | 为查询检索相关记忆 |
+| `/hooks/after-response` | POST | 处理并编码对话中的新记忆 |
+| `/hooks/consolidate` | POST | 触发记忆巩固（每日定时任务） |
+| `/hooks/backfill-embeddings` | POST | 一次性为无嵌入的节点生成向量 |
 
-| 方法 | 端点 | 说明 |
-|:----|:-----|:-----|
-| `POST` | `/hooks/session-start` | 初始化会话工作记忆 |
-| `POST` | `/hooks/before-query` | LLM 调用前检索相关记忆 |
-| `POST` | `/hooks/after-response` | 将用户消息编码为记忆 |
-| `POST` | `/hooks/session-end` | 清理会话状态 |
-| `POST` | `/hooks/consolidate` | 触发睡眠巩固周期 |
-| `POST` | `/hooks/check-prospective` | 检查时间/事件触发器 |
-| `POST` | `/hooks/backfill-embeddings` | 一次性：为已有节点生成向量 |
-
-### 使用示例
-
-```python
-import httpx
-
-BASE = "http://localhost:8100"
-CTX = {"tenant_id": "default", "user_id": "alice", "session_id": "s1"}
-
-# 编码一条消息
-httpx.post(f"{BASE}/hooks/after-response", json={
-    **CTX,
-    "user_message": "下周二去 Google 面试",
-    "assistant_response": "加油！需要我帮你准备吗？"
-})
-
-# 检索记忆
-resp = httpx.post(f"{BASE}/hooks/before-query", json={
-    **CTX,
-    "query": "我最近有什么面试？"
-})
-print(resp.json()["data"]["context"])
-# → "alice 下周二有一场 Google 的面试。"
-```
-
-## 记忆衰减模型
-
-基于艾宾浩斯遗忘曲线，不同类型的记忆以不同速率衰减：
-
-```
-有效半衰期 = 基础天数 × (1 + 重要度/10) × 区域系数
-
-区域系数：
-  情景记忆 = 0.5   (事件消退快)
-  语义记忆 = 2.0   (事实持久)
-  程序记忆 = 3.0   (技能最持久)
-  情绪记忆 = 1.0   (基准线)
-```
-
-## 向量检索
-
-Brain-Mem 使用图遍历 + 向量相似度的混合检索：
-
-- **Neo4j 向量索引**：MemoryNode 上的原生向量索引（1536维，余弦相似度）
-- **缓冲区向量搜索**：NumPy 暴力余弦计算（短期缓冲区 <1000 条时最优）
-- **Embedding**：支持任意 OpenAI 兼容的 Embedding API
-
-向量搜索作为语义兜底——当精确/模糊匹配都 miss 时，能捕获"那个做 AI 的朋友"这类查询（即使节点名是"张三"，summary 是"在字节做大模型"）。
-
-## OpenClaw 集成
-
-Brain-Mem 可作为 [OpenClaw](https://github.com/openclaw/openclaw) 的 context-engine 插件，为 Agent 对话注入长期记忆上下文：
-
-- **before_agent_start**：检索相关记忆，注入 `<retrieved-memories>` 上下文
-- **after_response**：将用户消息编码进记忆管线
-- **会话生命周期**：跨会话管理工作记忆
-
-Brain-Mem 增强（而非替代）OpenClaw 自带的对话历史——它提供跨会话的长期上下文，这是会话历史本身无法覆盖的。
-
-详见 [docs/openclaw-integration.md](docs/openclaw-integration.md)。
-
-## 评测
-
-运行内置评测套件验证所有记忆特性：
+### 示例：检索记忆
 
 ```bash
-python benchmark/run_benchmark.py --base-url http://localhost:8100
+# 启动会话
+curl -X POST http://localhost:8100/hooks/session-start \
+  -H "Content-Type: application/json" \
+  -d '{"tenant_id": "default", "user_id": "alice", "session_id": "sess-001"}'
+
+# 带记忆上下文的查询
+curl -X POST http://localhost:8100/hooks/before-query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tenant_id": "default",
+    "user_id": "alice",
+    "session_id": "sess-001",
+    "query": "我的减肥计划是什么？"
+  }'
+# 返回: {"code": 0, "data": {"context": "Alice的减肥计划目标是每日1600大卡..."}}
 ```
 
-最新结果（[完整报告](benchmark/RESULTS.md)）：
+### 示例：编码记忆
 
-| 维度 | 说明 | 状态 |
-|:----|:----|:----:|
-| 选择性编码 | 噪声丢弃，认知编码 | ✅ |
-| 向量语义召回 | 模糊查询找到正确节点 | ✅ |
-| 噪声过滤 | 无意义消息不会存储 | ✅ |
-| 分类路由 | 消息路由到正确分类 | ✅ |
-| 记忆重巩固 | 修正能更新已有记忆 | ✅ |
-| 前瞻性记忆 | 时间/事件触发器正确触发 | ✅ |
+```bash
+curl -X POST http://localhost:8100/hooks/after-response \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tenant_id": "default",
+    "user_id": "alice",
+    "session_id": "sess-001",
+    "user_message": "我决定下个月跳槽",
+    "assistant_message": "好的，我会帮你准备。"
+  }'
+```
 
-## 与其他方案对比
+## 快速开始
 
-| 特性 | Brain-Mem | 简单 RAG | Mem0 | Letta/MemGPT |
-|:----|:---------:|:--------:|:----:|:------------:|
-| 选择性编码 | ✅ | ❌ | ✅ | ✅ |
-| 知识图谱存储 | ✅ | ❌ | ✅ | ❌ |
-| 向量语义搜索 | ✅ | ✅ | ✅ | ✅ |
-| 情绪共鸣 | ✅ | ❌ | ❌ | ❌ |
-| 睡眠巩固 | ✅ | ❌ | ❌ | ❌ |
-| 自然遗忘（衰减） | ✅ | ❌ | ❌ | ❌ |
-| 记忆重巩固 | ✅ | ❌ | ❌ | ❌ |
-| 前瞻性记忆 | ✅ | ❌ | ❌ | ❌ |
-| 创造性重组 | ✅ | ❌ | ❌ | ❌ |
-| 间隔重复 | ✅ | ❌ | ❌ | ❌ |
-| 分层存储路由 | ✅ | ❌ | ❌ | ✅ |
-| 自托管 / 无厂商锁定 | ✅ | ✅ | ⚠️ | ✅ |
+### 方式一：Docker Compose（推荐）
 
-## Roadmap
+```bash
+git clone https://github.com/iCanDoAllThingszz/brain-mem.git
+cd brain-mem
+cp config.yaml.example config.yaml
+# 编辑 config.yaml，填入你的 LLM API 凭证和 Neo4j 密码
+docker compose up -d
+# 服务地址：http://localhost:8100
+```
 
-- [ ] 插件 SDK：自定义感知器/编码器规则
-- [ ] 多 Agent 共享记忆 + 访问控制
-- [ ] Web 可视化面板
-- [ ] 基准测试（LOCOMO 等记忆评测）
-- [ ] 更多 LLM 提供商的原生支持
+### 方式二：手动部署
 
-## 贡献
+```bash
+git clone https://github.com/iCanDoAllThingszz/brain-mem.git
+cd brain-mem
+cp config.yaml.example config.yaml
+# 编辑 config.yaml
 
-欢迎贡献！请先开 Issue 讨论你想改什么。
+pip install -r requirements.txt
+
+# 启动 Neo4j
+docker run -d --name neo4j \
+  -p 7474:7474 -p 7687:7687 \
+  -e NEO4J_AUTH=neo4j/your_password \
+  neo4j:5
+
+# 启动 Brain-Mem
+python -m uvicorn server.app:app --host 0.0.0.0 --port 8100
+```
+
+### 配置巩固定时任务
+
+```bash
+# 每天凌晨1:30执行巩固（根据时区调整）
+echo '30 17 * * * curl -s -X POST http://localhost:8100/hooks/consolidate \
+  -H "Content-Type: application/json" \
+  -d '"'"'{"tenant_id":"default","user_id":"your_user_id"}'"'"' \
+  >> /path/to/consolidation.log 2>&1' | crontab -
+```
+
+## 项目结构
+
+```
+brain-mem/
+├── server/
+│   ├── app.py                    # FastAPI 应用，所有 API 端点
+│   ├── activity_log.py           # 活动日志工具
+│   ├── engine/
+│   │   ├── perceiver.py          # 👁️ 感觉皮层 — 过滤与分类
+│   │   ├── evaluator.py          # 🧪 前额叶 — 评估记忆价值
+│   │   ├── encoder.py            # 🏗️ 海马体 — 实体生命周期管理
+│   │   ├── retriever.py          # 🔍 多通路记忆检索
+│   │   ├── consolidator.py       # 💤 睡眠巩固与图谱清洁
+│   │   ├── working_memory.py     # 🎯 会话级上下文缓存
+│   │   ├── prospective_checker.py# ⏰ 未来记忆触发器
+│   │   ├── log_writer.py         # 📝 分类文件日志
+│   │   ├── embedding_client.py   # 🔢 异步嵌入 + LRU缓存
+│   │   └── llm_client.py         # 🤖 共享LLM客户端
+│   ├── storage/
+│   │   ├── graph.py              # Neo4j 图操作 + 向量索引
+│   │   ├── buffer.py             # SQLite 缓冲区存储
+│   │   └── tag_dict.py           # 标签字典，用于实体分组
+│   └── models/
+│       ├── node.py               # MemoryNode 数据模型
+│       └── relation.py           # Relation 数据模型
+├── openclaw-plugin/
+│   └── index.ts                  # OpenClaw 集成插件
+├── benchmark/
+│   └── run_benchmark.py          # 自动化测试套件（6个维度）
+├── docs/
+│   └── V3-DESIGN.md             # v3 分层存储设计文档
+├── config.yaml.example           # 配置模板
+├── docker-compose.yml            # 一键部署
+├── Dockerfile                    # 容器构建
+├── demo.py                       # 完整管线演示脚本
+├── requirements.txt              # Python 依赖
+└── README_CN.md                  # 你在这里
+```
+
+## 配置说明
+
+将 `config.yaml.example` 复制为 `config.yaml` 并填入你的凭证：
+
+```yaml
+neo4j:
+  uri: "bolt://localhost:7687"
+  user: "neo4j"
+  password: "your_password"
+
+llm:
+  base_url: "https://api.openai.com/v1"  # 任何 OpenAI 兼容 API
+  api_key: "your_api_key"
+  model: "gpt-4o"
+
+embedding:
+  base_url: "https://api.openai.com/v1"
+  api_key: "your_api_key"
+  model: "text-embedding-3-small"
+```
+
+> ⚠️ `config.yaml` 已加入 gitignore，永远不要提交凭证。
+
+## 技术栈
+
+- **运行时**：Python 3.11+ / FastAPI / Uvicorn
+- **图数据库**：Neo4j 5.x（知识图谱 + 原生向量索引）
+- **缓冲区**：SQLite（轻量级，零配置）
+- **LLM**：任何 OpenAI 兼容 API
+- **嵌入**：任何嵌入 API（默认维度：1536）
+
+## 路线图
+
+- [ ] Web UI 图谱可视化与管理
+- [ ] 多用户协作记忆
+- [ ] 自定义感知器/评估器规则的插件市场
+- [ ] 流式检索，支持实时应用
+- [ ] 记忆导入/导出（JSON、Markdown）
+- [ ] Prometheus 指标与 Grafana 仪表盘
 
 ## 许可证
 
@@ -270,9 +392,6 @@ python benchmark/run_benchmark.py --base-url http://localhost:8100
 
 ---
 
-<div align="center">
-
-*"记忆不是过去的录像，而是现在的重构。"*
-— Daniel Schacter《记忆的七宗罪》
-
-</div>
+<p align="center">
+  <em>"大脑不是一个需要被填满的容器，而是一束需要被点燃的火焰。" — 普鲁塔克</em>
+</p>
