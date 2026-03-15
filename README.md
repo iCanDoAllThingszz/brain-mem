@@ -2,303 +2,281 @@
 
 # 🧠 Brain-Mem
 
-### Brain-Inspired Memory System for AI Agents
+**Cognitive Science-Inspired Memory System for AI Agents**
 
-*Give your AI agent a brain that remembers, forgets, dreams, and grows.*
+*Not just storage — a brain that encodes, forgets, dreams, and grows.*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11+-green.svg)](https://python.org)
-[![Neo4j](https://img.shields.io/badge/Neo4j-4.x-008CC1.svg)](https://neo4j.com)
-[![OpenClaw Plugin](https://img.shields.io/badge/OpenClaw-Plugin-orange.svg)](https://github.com/openclaw/openclaw)
+[![Neo4j 5.x](https://img.shields.io/badge/Neo4j-5.x-008CC1.svg)](https://neo4j.com)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-009688.svg)](https://fastapi.tiangolo.com)
 
 **English** | [中文](README_CN.md)
-
----
-
-<img src="https://img.shields.io/badge/Perceiver-Thalamus-ff6b6b?style=for-the-badge" />
-<img src="https://img.shields.io/badge/Evaluator-Prefrontal_Cortex-ffa502?style=for-the-badge" />
-<img src="https://img.shields.io/badge/Encoder-Hippocampus-7bed9f?style=for-the-badge" />
-<img src="https://img.shields.io/badge/Retriever-Multi_Path_Recall-70a1ff?style=for-the-badge" />
-<img src="https://img.shields.io/badge/Consolidator-Sleep-a29bfe?style=for-the-badge" />
 
 </div>
 
 ---
 
-## 💡 Why Brain-Mem?
+## Why Brain-Mem?
 
-Most AI agents have amnesia. They forget what you said yesterday, can't connect dots across conversations, and treat every session as a blank slate.
+Most AI memory systems are glorified key-value stores. They save everything, retrieve by keyword, and call it a day.
 
-Brain-Mem fixes this by giving agents a **human-like memory system** — one that:
+Human memory doesn't work that way. We **selectively encode** what matters, **emotionally weight** experiences, **consolidate during sleep**, **naturally forget** the unimportant, and **creatively recombine** fragments into new insights.
 
-- 🎯 **Selectively encodes** what matters (not everything)
-- 😢 **Weighs emotions** in memory formation and recall
-- 🌙 **Consolidates during sleep** (nightly cron) — deduplicates, discovers patterns, even dreams up creative insights
-- 📉 **Naturally forgets** unimportant things over time
-- 🔄 **Updates memories** when corrected ("actually, that interview went well")
-- ⏰ **Remembers the future** ("remind me about X next time we talk about Y")
+Brain-Mem brings these cognitive science principles to AI agents:
 
-## 🏗️ Architecture
+| Capability | Cognitive Basis | What it does |
+|:-----------|:---------------|:-------------|
+| Selective Encoding | Hippocampal gating | Only encodes novel, relevant information — noise is discarded |
+| Emotional Resonance | Mood-congruent recall | Sad context? Retrieves empathetic memories + encouraging ones |
+| Sleep Consolidation | Memory consolidation | Nightly cron deduplicates, discovers patterns, generates insights |
+| Natural Forgetting | Ebbinghaus curve | Unimportant memories decay; important ones persist via spaced repetition |
+| Reconsolidation | Memory updating | "Actually that went well" → corrects the stored memory in-place |
+| Prospective Memory | Future intentions | Time/event triggers: "remind me about X when we discuss Y" |
+| Creative Recombination | REM dreaming | Random memory fragments combined → occasional novel insights |
+| Vector Retrieval | Semantic similarity | Hybrid graph traversal + vector search for robust recall |
 
-### The Memory Pipeline
+## Architecture
 
 ```
-                    ┌─────────────────────────────────────┐
-                    │         Working Memory               │
-                    │   (user profile, goals, emotions)    │
-                    └──────────┬──────────────────────────┘
-                               │ provides context to all
-            ┌──────────────────┼──────────────────────┐
-            ▼                  ▼                      ▼
-     ┌────────────┐    ┌────────────┐         ┌────────────┐
-     │ Perceiver  │───▶│ Evaluator  │         │ Retriever  │
-     │ (Thalamus) │    │(Prefrontal)│         │(Multi-path)│
-     └────────────┘    └─────┬──────┘         └─────┬──────┘
-                             │                      │
-                             ▼                      │
-                       ┌────────────┐               │
-                       │  Encoder   │               │
-                       │(Hippocampus)│              │
-                       └─────┬──────┘               │
-                             │                      │
-                             ▼                      │
-                    ┌─────────────────┐             │
-                    │  Encoder Buffer │◀────────────┘
-                    │   (SQLite)      │  also searches buffer
-                    └────────┬────────┘
-                             │ nightly
-                             ▼
-                    ┌─────────────────┐
-                    │  Consolidator   │
-                    │  (Sleep cycle)  │
-                    └────────┬────────┘
-                             │
-                             ▼
-                    ┌─────────────────┐
-                    │   Neo4j Graph   │◀──── Retriever queries
-                    │ (Long-term Mem) │
-                    └─────────────────┘
+User Message
+     │
+     ▼
+┌──────────┐    ┌──────────┐    ┌──────────┐
+│Perceiver │───▶│Evaluator │───▶│ Encoder  │
+│(Thalamus)│    │(Cortex)  │    │(Hippocam)│
+└──────────┘    └──────────┘    └────┬─────┘
+ classify &      score novelty       │ entities + relations
+ rewrite         & relevance         │
+                                     ▼
+                              ┌─────────────┐    nightly    ┌─────────────┐
+                              │   Buffer    │──────────────▶│Consolidator │
+                              │  (SQLite)   │               │  (Sleep)    │
+                              └─────────────┘               └──────┬──────┘
+                                     ▲                             │
+                                     │                             ▼
+                              ┌─────────────┐               ┌─────────────┐
+                              │  Retriever  │◀─────────────▶│  Neo4j      │
+                              │ (Multi-path)│  graph + vec  │  (LTM)      │
+                              └─────────────┘               └─────────────┘
 ```
 
-### v3: Layered Storage
+**Core Pipeline:** Perceiver → Evaluator → Encoder → Buffer → Consolidator → Graph
 
-Not everything belongs in a knowledge graph. Brain-Mem routes information to the right place:
+**Retrieval:** 5-path strategy (exact → alias → fuzzy → dormant → vector semantic)
 
-| What you said | Category | Where it goes |
-|:---|:---|:---|
-| "我决定跳槽" | `cognition` | 📊 **Graph** — entity + relations |
-| "中午吃了沙拉300大卡" | `log_diet` | 📄 **File** + graph index |
-| "跑了5公里" | `log_exercise` | 📄 **File** + graph index |
-| "腾讯二面聊了分布式" | `log_interview` | 📄 **File** + graph index |
-| "不对，面试其实很好" | `reconsolidation` | 🔄 **Graph update** (correct existing node) |
-| "明天提醒我开会" | `prospective` | ⏰ **Graph** (trigger node) |
-| "忘掉这个人" | `forget` | 🚫 **Graph** (suppress node) |
-| "嗯嗯" | `noise` | 🗑️ Discarded |
+**Storage:** Layered by information type:
 
-## 🧬 8 Auxiliary Mechanisms
+| Input | Category | Storage |
+|:------|:---------|:--------|
+| "I decided to quit my job" | `cognition` | Knowledge Graph (entities + relations) |
+| "Lunch: salad, 300 kcal" | `log_diet` | Markdown file + buffer index |
+| "Ran 5km today" | `log_exercise` | Markdown file + buffer index |
+| "Actually, the interview went great" | `reconsolidation` | Graph update (corrects existing node) |
+| "Remind me about X tomorrow" | `prospective` | Graph (trigger node) |
+| "Forget this person" | `forget` | Graph (node suppressed, never retrieved) |
+| "hmm" / "ok" | `noise` | Discarded |
 
-Beyond the core pipeline, Brain-Mem implements cognitive science mechanisms that make memory feel *alive*:
+## Quick Start
 
-| # | Mechanism | Inspiration | What it does |
-|:--|:----------|:------------|:-------------|
-| 1 | 🎭 **Emotional Resonance** | Mood-congruent memory | Sad? Recall sad memories for empathy + happy ones for encouragement |
-| 2 | 🔄 **Reconsolidation** | Memory updating on recall | "Actually that went well" → updates the stored memory |
-| 3 | ⏰ **Prospective Memory** | Future intentions | Time triggers ("remind me tomorrow") + event triggers ("next time we discuss X") |
-| 4 | 🧹 **Motivated Forgetting** | Suppression | "Forget this person" → node hidden, never retrieved |
-| 5 | 📅 **Spaced Repetition** | Anki-style intervals | Important fading memories get flagged for natural review (1→3→7→21 days) |
-| 6 | ⚔️ **Interference** | Proactive/retroactive | New info contradicts old? Old relation gets `valid_until`, new one created |
-| 7 | 💡 **Creative Recombination** | REM sleep dreaming | Random memory fragments combined → occasional valuable insights |
-| 8 | 🔍 **Retrieval Compensation** | Tip-of-tongue | Empty results? Retry with relaxed thresholds and deeper graph traversal |
+### Prerequisites
 
-## 📖 A Day in the Life
+- Python 3.11+
+- Neo4j 5.x (Docker recommended)
+- Any OpenAI-compatible LLM API
 
-Here's how all the pieces work together in a real day:
+### Installation
 
-### 🌅 9:00 AM — Session Start
-```
-Working Memory boots up:
-├── Goals: [减肥计划, 跳槽计划]
-├── Spaced repetition: "不喜欢吃香菜" needs review
-└── Prospective: "9:00 提醒交报告" → TRIGGERED!
-```
-> 🤖 "早上好！别忘了今天要交报告"
-
-### 🥪 9:15 AM — Diet Logging
-```
-"早上吃了三明治，400大卡"
-  → log_diet → File: diet/2026-03-14.md
-  → Retriever recalls: "目标1600大卡/天"
-```
-> 🤖 "记上了！还剩1200大卡"
-
-### 😢 10:30 AM — Emotional Event
-```
-"腾讯二面挂了，好沮丧"
-  → cognition, emotion=sadness(7/10)
-  → Emotional resonance activates:
-     ├── Empathy: past failures recalled
-     └── Encouragement: past successes boosted
-```
-> 🤖 "上次XX也没过，但后来拿到了更好的offer"
-
-### 🔄 11:00 AM — Memory Correction
-```
-"不对，其实面试感觉还行"
-  → reconsolidation → update emotion: sadness → neutral
-  → Old value saved in correction history
+```bash
+git clone https://github.com/iCanDoAllThingszz/brain-mem.git
+cd brain-mem
+pip install -r requirements.txt
 ```
 
-### 🥗 12:00 PM — Spaced Repetition Success
-```
-"推荐个晚餐"
-  → Retriever finds: "不喜欢吃香菜" (flagged for review)
-  → Successfully recalled! Review interval extended to 3 days
-```
-> 🤖 "推荐几个清淡的，都没有香菜"
+### Start Neo4j
 
-### ⏰ 2:00 PM — Setting a Future Reminder
-```
-"下次聊到字节时提醒我问进度"
-  → prospective, trigger=event("字节"), status=pending
+```bash
+docker run -d --name neo4j-memory \
+  -p 7474:7474 -p 7687:7687 \
+  -e NEO4J_AUTH=neo4j/your-password \
+  neo4j:5
 ```
 
-### 🔔 3:00 PM — Event Trigger Fires
-```
-"字节那边有消息吗"
-  → ProspectiveChecker: "字节" matches! → inject reminder
-```
-> 🤖 "对了，你之前让我提醒你问字节面试进度"
+### Configure
 
-### 🚫 4:00 PM — Forgetting on Demand
-```
-"忘掉魏小康"
-  → forget → node.status = suppressed
-  → Still in graph, but invisible to retrieval
+```bash
+cp config.yaml.example config.yaml
 ```
 
-### 🌙 1:00 AM — Sleep Consolidation
+Edit `config.yaml`:
+
+```yaml
+llm:
+  base_url: "https://api.openai.com/v1"  # Any OpenAI-compatible endpoint
+  model: "gpt-4o"
+  api_key: "sk-..."
+
+storage:
+  neo4j:
+    uri: "bolt://localhost:7687"
+    user: "neo4j"
+    password: "your-password"
+  buffer:
+    path: "./data/buffer.db"
 ```
-Consolidator runs:
-├── Deduplicate today's entities
-├── Resolve conflicts
-├── Discover patterns: "面试频率在加速"
-├── Creative recombination: 2 attempts
-│   └── Insight: "brain-memory可以做成开源产品" ✨
-├── Spaced repetition: flag fading important memories
-├── Global decay: all nodes age naturally
-└── Archive buffer
+
+### Run
+
+```bash
+python -m uvicorn server.app:app --host 0.0.0.0 --port 8100
 ```
 
-## 🛠️ Tech Stack
+### Setup Nightly Consolidation
 
-| Component | Technology |
-|:----------|:----------|
-| API Server | Python 3.11 · FastAPI · Uvicorn |
-| Long-term Memory | Neo4j 4.x |
-| Short-term Buffer | SQLite |
-| File Logs | Markdown |
-| LLM Backend | Any OpenAI-compatible API |
-| Plugin Host | OpenClaw Gateway (TypeScript) |
-| Process Manager | systemd |
+```bash
+# Run consolidation daily at 1:00 AM
+(crontab -l 2>/dev/null; echo "0 1 * * * curl -s -X POST http://localhost:8100/hooks/consolidate \
+  -H 'Content-Type: application/json' \
+  -d '{\"tenant_id\":\"default\",\"user_id\":\"your-user\"}'") | crontab -
+```
 
-## 📁 Project Structure
+## API Reference
+
+### Hooks (Integration Points)
+
+| Method | Endpoint | Description |
+|:-------|:---------|:------------|
+| `POST` | `/hooks/session-start` | Initialize working memory for a session |
+| `POST` | `/hooks/before-query` | Retrieve relevant memories before LLM call |
+| `POST` | `/hooks/after-response` | Encode user message into memory |
+| `POST` | `/hooks/session-end` | Cleanup session state |
+| `POST` | `/hooks/consolidate` | Trigger sleep consolidation cycle |
+| `POST` | `/hooks/check-prospective` | Check time/event-based memory triggers |
+| `POST` | `/hooks/backfill-embeddings` | One-time: generate embeddings for existing nodes |
+
+### Health & Monitoring
+
+| Method | Endpoint | Description |
+|:-------|:---------|:------------|
+| `GET` | `/health` | Service health check |
+| `GET` | `/logs?n=30` | Recent activity logs |
+
+### Example: Encode + Retrieve
+
+```python
+import httpx
+
+BASE = "http://localhost:8100"
+CTX = {"tenant_id": "default", "user_id": "alice", "session_id": "s1"}
+
+# Encode a message
+httpx.post(f"{BASE}/hooks/after-response", json={
+    **CTX,
+    "user_message": "I'm interviewing at Google next Tuesday",
+    "assistant_response": "Good luck! Want me to help you prepare?"
+})
+
+# Retrieve memories
+resp = httpx.post(f"{BASE}/hooks/before-query", json={
+    **CTX,
+    "query": "What interviews do I have coming up?"
+})
+print(resp.json()["data"]["context"])
+# → "alice has an upcoming interview at Google scheduled for next Tuesday."
+```
+
+## Memory Decay Model
+
+Inspired by the Ebbinghaus forgetting curve, memories decay at different rates based on type and importance:
+
+```
+effective_half_life = base_days × (1 + importance/10) × zone_factor
+
+Zone factors:
+  episodic   = 0.5   (events fade fast)
+  semantic   = 2.0   (facts persist)
+  procedural = 3.0   (skills last longest)
+  emotional  = 1.0   (baseline)
+```
+
+## Vector Retrieval
+
+Brain-Mem uses hybrid retrieval combining graph traversal with vector similarity search:
+
+- **Neo4j Vector Index**: Native vector index on `MemoryNode.embedding` (1536-dim, cosine similarity)
+- **Buffer Vector Search**: NumPy brute-force cosine on short-term buffer (optimal for <1000 items)
+- **Embedding**: Any OpenAI-compatible embedding API
+
+Vector search acts as a semantic fallback when exact/fuzzy matching misses — catching queries like "that AI friend" when the node is named "张三" with summary "works on LLMs at ByteDance".
+
+## Project Structure
 
 ```
 brain-mem/
 ├── server/
-│   ├── app.py                        # FastAPI + hook routing
+│   ├── app.py                     # FastAPI application + hook routing
 │   ├── engine/
-│   │   ├── perceiver.py              # 🔴 Thalamus — classify & rewrite
-│   │   ├── evaluator.py              # 🟠 Prefrontal — score & decide
-│   │   ├── encoder.py                # 🟢 Hippocampus — extract & encode
-│   │   ├── retriever.py              # 🔵 Multi-path recall + emotional resonance
-│   │   ├── consolidator.py           # 🟣 Sleep — consolidate + dream
-│   │   ├── working_memory.py         # Session context cache
-│   │   ├── log_writer.py             # v3 file logger + graph index
-│   │   ├── prospective_checker.py    # ⏰ Time/event trigger checker
-│   │   └── llm_client.py             # LLM API client
+│   │   ├── perceiver.py           # Thalamus — classify & rewrite input
+│   │   ├── evaluator.py           # Prefrontal cortex — score & gate
+│   │   ├── encoder.py             # Hippocampus — extract entities & encode
+│   │   ├── retriever.py           # Multi-path recall + vector search
+│   │   ├── consolidator.py        # Sleep cycle — consolidate & dream
+│   │   ├── working_memory.py      # Session context (goals, emotions)
+│   │   ├── embedding_client.py    # Embedding API client with LRU cache
+│   │   ├── log_writer.py          # Layered file logger + graph index
+│   │   ├── prospective_checker.py # Time/event trigger checker
+│   │   └── llm_client.py          # LLM API client
 │   ├── storage/
-│   │   ├── graph.py                  # Neo4j operations
-│   │   ├── buffer.py                 # SQLite buffer
-│   │   └── tag_dict.py              # Tag taxonomy
+│   │   ├── graph.py               # Neo4j operations + vector index
+│   │   ├── buffer.py              # SQLite buffer + embedding storage
+│   │   └── tag_dict.py            # Tag taxonomy
 │   └── models/
-│       ├── node.py                   # MemoryNode
-│       └── relation.py               # Relation
-├── docs/
-│   └── V3-DESIGN.md                  # Architecture design doc
-├── data/                             # Runtime data (auto-created)
-└── config.yaml
+│       ├── node.py                # MemoryNode schema
+│       └── relation.py            # Relation schema
+├── config.yaml                    # Configuration
+├── requirements.txt
+└── docs/
+    └── V3-DESIGN.md               # Detailed architecture design
 ```
 
-## 🚀 Quick Start
+## Comparison with Other Approaches
 
-```bash
-# 1. Clone & install
-git clone https://github.com/iCanDoAllThingszz/brain-mem.git
-cd brain-mem
-pip install -r requirements.txt
+| Feature | Brain-Mem | Simple RAG | Mem0 | Letta/MemGPT |
+|:--------|:---------:|:----------:|:----:|:------------:|
+| Selective encoding (not everything) | ✅ | ❌ | ✅ | ✅ |
+| Knowledge graph storage | ✅ | ❌ | ✅ | ❌ |
+| Vector semantic search | ✅ | ✅ | ✅ | ✅ |
+| Emotional resonance | ✅ | ❌ | ❌ | ❌ |
+| Sleep consolidation | ✅ | ❌ | ❌ | ❌ |
+| Natural forgetting (decay) | ✅ | ❌ | ❌ | ❌ |
+| Memory reconsolidation | ✅ | ❌ | ❌ | ❌ |
+| Prospective memory (triggers) | ✅ | ❌ | ❌ | ❌ |
+| Creative recombination | ✅ | ❌ | ❌ | ❌ |
+| Spaced repetition | ✅ | ❌ | ❌ | ❌ |
+| Layered storage routing | ✅ | ❌ | ❌ | ✅ |
+| Self-hosted / no vendor lock-in | ✅ | ✅ | ⚠️ | ✅ |
 
-# 2. Start Neo4j
-docker run -d --name neo4j-memory \
-  -p 7474:7474 -p 7687:7687 \
-  -e NEO4J_AUTH=neo4j/your-password \
-  neo4j:4.4
+## Roadmap
 
-# 3. Configure
-cp config.yaml.example config.yaml
-# Edit config.yaml with your Neo4j password and LLM API key
+- [ ] Plugin SDK for custom perceiver/encoder rules
+- [ ] Multi-agent shared memory with access control
+- [ ] Web dashboard for memory visualization
+- [ ] Benchmark suite against LOCOMO and other memory benchmarks
+- [ ] First-class support for more LLM providers
 
-# 4. Run
-python -m uvicorn server.app:app --host 0.0.0.0 --port 8100
+## Contributing
 
-# 5. Setup nightly consolidation
-echo "30 17 * * * curl -s -X POST http://localhost:8100/hooks/consolidate \
-  -H 'Content-Type: application/json' \
-  -d '{\"tenant_id\":\"default\",\"user_id\":\"your-user\"}'" | crontab -
-```
+Contributions welcome! Please open an issue first to discuss what you'd like to change.
 
-## 📡 API
+## License
 
-| Method | Endpoint | Description |
-|:-------|:---------|:------------|
-| `GET` | `/health` | Health check |
-| `GET` | `/logs?n=30` | Activity logs |
-| `POST` | `/hooks/session-start` | Load working memory |
-| `POST` | `/hooks/before-query` | Retrieve memories |
-| `POST` | `/hooks/after-response` | Encode user message |
-| `POST` | `/hooks/session-end` | Session cleanup |
-| `POST` | `/hooks/consolidate` | Trigger consolidation |
-| `POST` | `/hooks/check-prospective` | Check prospective triggers |
-
-## 📉 Memory Decay Model
-
-Inspired by the Ebbinghaus forgetting curve:
-
-```
-effective_half_life = base × (1 + importance/10) × zone_factor
-
-Zone factors:
-  🎬 episodic   = 0.5   (events fade fast)
-  📚 semantic   = 2.0   (facts persist)
-  🔧 procedural = 3.0   (skills last longest)
-  💛 emotional  = 1.0   (baseline)
-
-Example (base = 30 days):
-  Event,  imp=5:  30 × 1.5 × 0.5 =  22 days
-  Fact,   imp=5:  30 × 1.5 × 2.0 =  90 days
-  Skill,  imp=8:  30 × 1.8 × 3.0 = 162 days
-```
-
-## 📄 License
-
-MIT
+[MIT](LICENSE)
 
 ---
 
 <div align="center">
 
-Built with 🧠 by **酪酪 & 禹哥**
-
-*"记忆不是过去的录像，而是现在的重构。" — Daniel Schacter*
+*"Memory is not a recording of the past, but a reconstruction in the present."*
+— Daniel Schacter, *The Seven Sins of Memory*
 
 </div>
