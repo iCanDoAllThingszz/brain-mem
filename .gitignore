@@ -2,11 +2,11 @@ __pycache__/
 *.pyc
 *.pyo
 .env
-data/buffer.db
-data/activity.log
-data/tag_dict.json
+data/
 *.log
 .DS_Store
 node_modules/
 TASK-*.md
 scripts/cleanup.py
+config.yaml
+!config.yaml.example
