@@ -79,55 +79,49 @@ Brain-Mem 将这些认知科学原理带给 AI Agent：
 
 ## 快速开始
 
-### 环境要求
+### 方式 A：Docker Compose（推荐）
+
+一条命令启动全套：
+
+```bash
+git clone https://github.com/iCanDoAllThingszz/brain-mem.git
+cd brain-mem
+cp config.yaml.example config.yaml
+# 编辑 config.yaml，填入你的 LLM API key
+docker compose up -d
+```
+
+搞定。试试 demo：
+
+```bash
+pip install httpx
+python demo.py
+```
+
+### 方式 B：手动安装
+
+#### 环境要求
 
 - Python 3.11+
-- Neo4j 5.x（推荐 Docker）
+- Neo4j 5.x
 - 任意 OpenAI 兼容的 LLM API
-
-### 安装
 
 ```bash
 git clone https://github.com/iCanDoAllThingszz/brain-mem.git
 cd brain-mem
 pip install -r requirements.txt
-```
 
-### 启动 Neo4j
-
-```bash
+# 启动 Neo4j
 docker run -d --name neo4j-memory \
   -p 7474:7474 -p 7687:7687 \
   -e NEO4J_AUTH=neo4j/your-password \
   neo4j:5
-```
 
-### 配置
-
-```bash
+# 配置
 cp config.yaml.example config.yaml
-```
+# 编辑 config.yaml，填入 Neo4j 密码和 LLM API key
 
-编辑 `config.yaml`：
-
-```yaml
-llm:
-  base_url: "https://api.openai.com/v1"  # 任意 OpenAI 兼容端点
-  model: "gpt-4o"
-  api_key: "sk-..."
-
-storage:
-  neo4j:
-    uri: "bolt://localhost:7687"
-    user: "neo4j"
-    password: "your-password"
-  buffer:
-    path: "./data/buffer.db"
-```
-
-### 运行
-
-```bash
+# 运行
 python -m uvicorn server.app:app --host 0.0.0.0 --port 8100
 ```
 
@@ -138,6 +132,14 @@ python -m uvicorn server.app:app --host 0.0.0.0 --port 8100
 (crontab -l 2>/dev/null; echo "0 1 * * * curl -s -X POST http://localhost:8100/hooks/consolidate \
   -H 'Content-Type: application/json' \
   -d '{\"tenant_id\":\"default\",\"user_id\":\"your-user\"}'") | crontab -
+```
+
+### 运行 Demo
+
+`demo.py` 演示完整管线——编码不同类型的消息并检索记忆：
+
+```bash
+python demo.py --base-url http://localhost:8100
 ```
 
 ## API 参考
@@ -201,6 +203,37 @@ Brain-Mem 使用图遍历 + 向量相似度的混合检索：
 - **Embedding**：支持任意 OpenAI 兼容的 Embedding API
 
 向量搜索作为语义兜底——当精确/模糊匹配都 miss 时，能捕获"那个做 AI 的朋友"这类查询（即使节点名是"张三"，summary 是"在字节做大模型"）。
+
+## OpenClaw 集成
+
+Brain-Mem 可作为 [OpenClaw](https://github.com/openclaw/openclaw) 的 context-engine 插件，为 Agent 对话注入长期记忆上下文：
+
+- **before_agent_start**：检索相关记忆，注入 `<retrieved-memories>` 上下文
+- **after_response**：将用户消息编码进记忆管线
+- **会话生命周期**：跨会话管理工作记忆
+
+Brain-Mem 增强（而非替代）OpenClaw 自带的对话历史——它提供跨会话的长期上下文，这是会话历史本身无法覆盖的。
+
+详见 [docs/openclaw-integration.md](docs/openclaw-integration.md)。
+
+## 评测
+
+运行内置评测套件验证所有记忆特性：
+
+```bash
+python benchmark/run_benchmark.py --base-url http://localhost:8100
+```
+
+最新结果（[完整报告](benchmark/RESULTS.md)）：
+
+| 维度 | 说明 | 状态 |
+|:----|:----|:----:|
+| 选择性编码 | 噪声丢弃，认知编码 | ✅ |
+| 向量语义召回 | 模糊查询找到正确节点 | ✅ |
+| 噪声过滤 | 无意义消息不会存储 | ✅ |
+| 分类路由 | 消息路由到正确分类 | ✅ |
+| 记忆重巩固 | 修正能更新已有记忆 | ✅ |
+| 前瞻性记忆 | 时间/事件触发器正确触发 | ✅ |
 
 ## 与其他方案对比
 

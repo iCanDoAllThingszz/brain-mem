@@ -79,55 +79,49 @@ User Message
 
 ## Quick Start
 
-### Prerequisites
+### Option A: Docker Compose (Recommended)
+
+The fastest way to get running — one command starts everything:
+
+```bash
+git clone https://github.com/iCanDoAllThingszz/brain-mem.git
+cd brain-mem
+cp config.yaml.example config.yaml
+# Edit config.yaml with your LLM API key
+docker compose up -d
+```
+
+That's it. Neo4j + Brain-Mem are running. Try the demo:
+
+```bash
+pip install httpx
+python demo.py
+```
+
+### Option B: Manual Setup
+
+#### Prerequisites
 
 - Python 3.11+
-- Neo4j 5.x (Docker recommended)
+- Neo4j 5.x
 - Any OpenAI-compatible LLM API
-
-### Installation
 
 ```bash
 git clone https://github.com/iCanDoAllThingszz/brain-mem.git
 cd brain-mem
 pip install -r requirements.txt
-```
 
-### Start Neo4j
-
-```bash
+# Start Neo4j
 docker run -d --name neo4j-memory \
   -p 7474:7474 -p 7687:7687 \
   -e NEO4J_AUTH=neo4j/your-password \
   neo4j:5
-```
 
-### Configure
-
-```bash
+# Configure
 cp config.yaml.example config.yaml
-```
+# Edit config.yaml with your Neo4j password and LLM API key
 
-Edit `config.yaml`:
-
-```yaml
-llm:
-  base_url: "https://api.openai.com/v1"  # Any OpenAI-compatible endpoint
-  model: "gpt-4o"
-  api_key: "sk-..."
-
-storage:
-  neo4j:
-    uri: "bolt://localhost:7687"
-    user: "neo4j"
-    password: "your-password"
-  buffer:
-    path: "./data/buffer.db"
-```
-
-### Run
-
-```bash
+# Run
 python -m uvicorn server.app:app --host 0.0.0.0 --port 8100
 ```
 
@@ -138,6 +132,14 @@ python -m uvicorn server.app:app --host 0.0.0.0 --port 8100
 (crontab -l 2>/dev/null; echo "0 1 * * * curl -s -X POST http://localhost:8100/hooks/consolidate \
   -H 'Content-Type: application/json' \
   -d '{\"tenant_id\":\"default\",\"user_id\":\"your-user\"}'") | crontab -
+```
+
+### Run the Demo
+
+`demo.py` walks through the full pipeline — encoding different message types and retrieving memories:
+
+```bash
+python demo.py --base-url http://localhost:8100
 ```
 
 ## API Reference
@@ -225,7 +227,7 @@ brain-mem/
 │   │   ├── embedding_client.py    # Embedding API client with LRU cache
 │   │   ├── log_writer.py          # Layered file logger + graph index
 │   │   ├── prospective_checker.py # Time/event trigger checker
-│   │   └── llm_client.py          # LLM API client
+│   │   └── llm_client.py         # LLM API client
 │   ├── storage/
 │   │   ├── graph.py               # Neo4j operations + vector index
 │   │   ├── buffer.py              # SQLite buffer + embedding storage
@@ -233,11 +235,49 @@ brain-mem/
 │   └── models/
 │       ├── node.py                # MemoryNode schema
 │       └── relation.py            # Relation schema
-├── config.yaml                    # Configuration
-├── requirements.txt
-└── docs/
-    └── V3-DESIGN.md               # Detailed architecture design
+├── benchmark/
+│   ├── run_benchmark.py           # Automated test suite
+│   └── RESULTS.md                 # Latest benchmark results
+├── docs/
+│   ├── V3-DESIGN.md               # Detailed architecture design
+│   └── openclaw-integration.md    # OpenClaw plugin guide
+├── Dockerfile                     # Container image
+├── docker-compose.yml             # One-command deployment
+├── demo.py                        # Interactive demo script
+├── config.yaml.example            # Configuration template
+└── requirements.txt
 ```
+
+## OpenClaw Integration
+
+Brain-Mem works as a [context-engine plugin](https://docs.openclaw.ai) for [OpenClaw](https://github.com/openclaw/openclaw), injecting long-term memory context into agent conversations:
+
+- **before_agent_start**: Retrieves relevant memories and injects them as `<retrieved-memories>` context
+- **after_response**: Encodes the user's message into the memory pipeline
+- **session lifecycle**: Manages working memory across sessions
+
+Brain-Mem augments (not replaces) OpenClaw's built-in conversation history — it provides cross-session, long-term context that session history alone can't.
+
+See [docs/openclaw-integration.md](docs/openclaw-integration.md) for the full setup guide.
+
+## Benchmark
+
+Run the built-in benchmark suite to validate all memory features:
+
+```bash
+python benchmark/run_benchmark.py --base-url http://localhost:8100
+```
+
+Latest results ([full report](benchmark/RESULTS.md)):
+
+| Dimension | Description | Status |
+|:----------|:-----------|:------:|
+| Selective Encoding | Noise discarded, cognition encoded | ✅ |
+| Vector Semantic Recall | Fuzzy queries find correct nodes | ✅ |
+| Noise Filtering | Meaningless messages never stored | ✅ |
+| Classification Routing | Messages routed to correct category | ✅ |
+| Reconsolidation | Corrections update existing memories | ✅ |
+| Prospective Memory | Time/event triggers fire correctly | ✅ |
 
 ## Comparison with Other Approaches
 
