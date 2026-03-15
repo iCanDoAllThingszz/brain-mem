@@ -720,3 +720,13 @@ class GraphStore:
             result = await session.run(query, from_id=from_id, to_id=to_id, tenant_id=tenant_id, user_id=user_id)
             record = await result.single()
             return record and record["deleted"] > 0
+
+    async def find_nodes_without_embedding(self, tenant_id: str, user_id: str) -> list:
+        """Find all active nodes that don't have an embedding yet."""
+        async with self._driver.session() as session:
+            result = await session.run("""
+                MATCH (n:MemoryNode {tenant_id: $tid, user_id: $uid})
+                WHERE n.embedding IS NULL AND n.status = 'active'
+                RETURN n.id as id, n.name as name, n.summary as summary
+            """, tid=tenant_id, uid=user_id)
+            return [dict(r) async for r in result]
