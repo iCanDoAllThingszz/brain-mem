@@ -10,3 +10,4 @@ TASK-*.md
 scripts/cleanup.py
 config.yaml
 !config.yaml.example
+*.backup

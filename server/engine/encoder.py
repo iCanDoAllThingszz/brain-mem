@@ -1,9 +1,14 @@
 """
 Encoder engine component for the brain-memory service.
 Corresponds to the hippocampus in the human brain.
-Transforms raw messages into structured memory units and writes them to the buffer.
 
-v2: Entity lifecycle management — tag归属 + 去重 + 关系构建 合并为单次LLM调用。
+编码器引擎组件 — 对应人脑的海马体。
+将原始消息转换为结构化记忆单元并写入缓冲区。
+
+v2: 实体生命周期管理 — tag归属 + 去重 + 关系构建 合并为单次LLM调用。
+
+优化历史：
+- 2026-03-17: 提示词中文化，加强名称变体识别和关系提取规则
 """
 
 from __future__ import annotations
@@ -34,91 +39,116 @@ PRONOUN_TO_USER = {"我", "用户", "用户本人", "本人"}
 # Step 1: 粗提取 — 从消息中提取原始实体和关系
 # ---------------------------------------------------------------------------
 _EXTRACT_SYSTEM = """\
-You are an information extraction engine for a PERSONAL memory system. \
-Extract entities and relationships that are specific to this user's life.
+你是个人记忆系统的信息提取引擎。提取与用户生活相关的实体和关系。
 
-Rules:
-- Extract named entities: people, organizations, places, concepts, events, decisions, plans.
-- ONLY extract entities that are relevant to the user personally. \
-  Skip universal common knowledge (e.g., "地球", "太阳", "水") unless the user \
-  has a personal connection to it.
-- **PRONOUN RESOLUTION**: Replace pronouns like "我", "用户", "本人" with the user's actual name \
-  from context (e.g., "赵禹"). Never create an entity named "用户" or "我" — always resolve to \
-  the real person. If the user's name is unknown, use "用户本人" as a placeholder.
-- **CRITICAL USER ALIAS RULE**: The following words ALL refer to the same person "赵禹": \
-  我, 用户, 用户本人, 本人, 禹哥. NEVER create separate entities for these. ALWAYS use "赵禹".
-- Assign a memory zone: semantic / episodic / procedural / emotional.
-- Assign 1-2 preliminary tags per entity (Chinese labels preferred).
-- Ignore garbled/encoded names (like "Gbusrw Jflvnkmwi") — display artifacts.
-- Relation types: UPPER_SNAKE_CASE (e.g., WORKS_AT, DECIDED_TO).
-- If the message mixes common knowledge with personal info, only extract the personal parts.
+规则：
+- 提取命名实体：人物、组织、地点、概念、事件、决策、计划。
+- 只提取与用户个人相关的实体。跳过通用常识（如"地球"、"太阳"、"水"），\
+  除非用户与之有个人联系。
 
-Return ONLY valid JSON:
+- **代词解析**：将"我"、"用户"、"本人"等代词替换为用户的真实姓名（如"赵禹"）。\
+  绝不创建名为"用户"或"我"的实体 — 总是解析为真实人名。\
+  如果用户姓名未知，使用"用户本人"作为占位符。
+
+- **关键用户别名规则**：以下词汇都指同一个人"赵禹"：\
+  我、用户、用户本人、本人、禹哥。绝不为这些创建单独实体。总是使用"赵禹"。
+
+- **名称变体识别**：注意常见名称模式：\
+  * 全名 vs 昵称："范鹏程" = "鹏程"，"张钧梦阳" = "梦阳" \
+  * 称谓+姓名："凡哥"可能是"刘凡"，"小可"可能是昵称 \
+  * 提取时优先使用完整姓名，但将昵称标注为潜在别名
+
+- 分配记忆区域：semantic（语义）/ episodic（情景）/ procedural（程序）/ emotional（情感）
+- 为每个实体分配1-2个初步标签（优先中文标签）
+- 忽略乱码/编码名称（如"Gbusrw Jflvnkmwi"）— 这些是显示伪影
+- 关系类型：UPPER_SNAKE_CASE（如WORKS_AT、DECIDED_TO）或中文（如"同事"、"虚线"）
+- 如果消息混合了常识和个人信息，只提取个人相关部分
+
+**关系提取要全面**：
+- 提取消息中明确提到的关系
+- 提取上下文透露的隐含关系（如"我和鹏程都..."暗示他们是同事/朋友）
+- 包括组织关系：REPORTS_TO（汇报给）、MANAGES（管理）、COLLABORATES_WITH（协作）
+- 包括社交关系：COLLEAGUE（同事）、FRIEND（朋友）、CLASSMATE（同学）、FAMILY（家人）
+
+返回格式（仅JSON）：
 {
   "entities": [
-    {"name": "entity name", "tags": ["tag1"], "zone": "semantic", "summary": "one sentence"}
+    {"name": "实体名称", "tags": ["标签1"], "zone": "semantic", "summary": "一句话描述"}
   ],
   "relations": [
-    {"from_name": "A", "to_name": "B", "type": "REL_TYPE", "description": "desc"}
+    {"from_name": "A", "to_name": "B", "type": "关系类型", "description": "关系描述"}
   ]
 }
 """
-
 # ---------------------------------------------------------------------------
 # Step 2+3+4 合并: 实体解析 — tag归属 + 去重 + 关系构建 一次LLM调用
 # ---------------------------------------------------------------------------
 _RESOLVE_ENTITY_SYSTEM = """\
-You are a knowledge graph entity resolver. Given a newly extracted entity and \
-the existing entities in the graph that share similar tags, decide what to do.
+你是知识图谱实体解析器。给定一个新提取的实体和图谱中具有相似标签的已有实体，决定如何处理。
 
-You must decide ONE of three actions:
-1. "merge" — The new entity is the SAME entity as an existing one (same person/org/concept). \
-   Use this when the new entity is just another mention or alias of an existing entity. \
-   Example: "腾讯" and "Tencent" are the same company → merge.
-2. "update" — The new entity adds NEW information to an existing entity. \
-   Use this when the entity already exists but the new mention provides additional details. \
-   Example: existing "赵禹" has no job info, new mention says "赵禹在美团工作" → update.
-3. "create" — The new entity is genuinely NEW and distinct from all existing entities. \
-   Only use this if you're confident it's a different entity.
+你必须决定以下三个动作之一：
+1. "merge"（合并）— 新实体与已有实体是同一个（同一人/组织/概念）。\
+   当新实体只是已有实体的另一次提及或别名时使用。\
+   示例："腾讯"和"Tencent"是同一家公司 → merge。
 
-**IMPORTANT**: Be conservative with "create". If there's ANY chance the entity already exists, \
-prefer "merge" or "update". Duplicate entities are worse than merged entities.
+2. "update"（更新）— 新实体为已有实体添加了新信息。\
+   当实体已存在但新提及提供了额外细节时使用。\
+   示例：已有"赵禹"没有工作信息，新提及说"赵禹在美团工作" → update。
 
-Tag assignment rules:
-- Use the provided tag taxonomy. Pick the best matching tag(s).
-- If no existing tag fits, propose a new tag that is GENERAL enough to be reused \
-  (e.g., "医疗" not "牙科手术", "交通" not "地铁3号线").
-- Each entity should have 1-2 tags maximum.
+3. "create"（创建）— 新实体是真正的新实体，与所有已有实体不同。\
+   只有在确信是不同实体时才使用。
 
-Return ONLY valid JSON:
+**重要**：对"create"保持保守。如果有任何可能实体已存在，\
+优先选择"merge"或"update"。重复实体比合并实体更糟糕。
+
+**名称匹配规则**：
+- 如果新实体名称是已有实体名称的子串（如"鹏程" vs "范鹏程"），\
+  它们很可能是同一人 → 优先"merge"
+- 如果新实体名称是已有名称的昵称或简称（如"小可" vs "可可"），\
+  它们很可能是同一人 → 优先"merge"
+- 如果新实体名称仅在称谓/敬称上不同（如"凡哥" vs "刘凡"），\
+  它们很可能是同一人 → 优先"merge"
+- 不确定时，检查上下文：如果它们出现在相似的角色/关系中，优先"merge"
+
+**关系上下文**：决定merge vs create时，考虑：
+- 它们是否共享相同的关系？（如都是赵禹的同事）
+- 它们是否有相同的角色？（如都是"虚线leader"）
+- 如果任一为是，它们很可能是同一实体 → 优先"merge"
+
+标签分配规则：
+- 使用提供的标签分类法。选择最匹配的标签。
+- 如果没有现有标签合适，提议一个足够通用可复用的新标签\
+  （如"医疗"而非"牙科手术"，"交通"而非"地铁3号线"）。
+- 每个实体最多1-2个标签。
+
+返回格式（仅JSON）：
 {
   "action": "merge" | "update" | "create",
-  "resolved_tags": ["tag1", "tag2"],
-  "target_entity_name": "name of existing entity to merge/update into (null if create)",
-  "aliases_to_add": ["alias1"],
-  "summary_update": "updated summary text (null if no change)",
+  "resolved_tags": ["标签1", "标签2"],
+  "target_entity_name": "要merge/update到的已有实体名称（create时为null）",
+  "aliases_to_add": ["别名1"],
+  "summary_update": "更新后的摘要文本（无变化时为null）",
   "properties_update": {},
   "new_relations": [
-    {"from_name": "A", "to_name": "B", "type": "REL_TYPE", "description": "desc"}
+    {"from_name": "A", "to_name": "B", "type": "关系类型", "description": "关系描述"}
   ],
-  "reason": "one-sentence explanation"
+  "reason": "为什么选择这个action的一句话解释"
 }
 """
 
 # ---------------------------------------------------------------------------
-# Session summary prompt (unchanged)
+# 会话摘要提示词
 # ---------------------------------------------------------------------------
 _SUMMARY_SYSTEM = """\
-You are a session summarizer for an AI agent's memory system. \
-Summarize the conversation into a concise structured summary.
+你是AI Agent记忆系统的会话摘要器。将对话总结为简洁的结构化摘要。
 
-Return ONLY valid JSON:
+返回格式（仅JSON）：
 {
-  "topics": ["topic1", "topic2"],
-  "key_conclusions": ["conclusion1"],
-  "pending_points": ["unresolved1"],
+  "topics": ["话题1", "话题2"],
+  "key_conclusions": ["结论1"],
+  "pending_points": ["未解决1"],
   "emotional_arc": "positive|negative|neutral|mixed",
-  "summary_text": "2-3 sentence summary"
+  "summary_text": "2-3句话的摘要"
 }
 """
 
