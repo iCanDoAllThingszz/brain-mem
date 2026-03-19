@@ -13,11 +13,12 @@ v2: 实体生命周期管理 — tag归属 + 去重 + 关系构建 合并为单�
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from server.engine.llm_client import call_llm, call_llm_json
 from server.engine.log_writer import LogWriter
@@ -196,7 +197,7 @@ class Encoder:
             return await self._encode_cognition(
                 message, evaluation, tenant_id, user_id, session_id, working_memory
             )
-        elif category.startswith("log_"):
+        elif category == "log":
             # New flow: write to file + update graph index
             return await self._encode_log(
                 message, evaluation, category, tenant_id, user_id, session_id
@@ -233,14 +234,8 @@ class Encoder:
     ) -> Dict[str, Any]:
         """Original cognition encoding flow (v2)."""
 
-        # Step 0: Semantic dedup check against recent buffer (hybrid approach)
-        recent = self.buffer.read_recent(tenant_id, user_id, limit=20)
-        if await self._is_semantic_duplicate(message, recent):
-            logger.info("Skipping semantically duplicate message: %.60s", message)
-            return {"skipped": True, "reason": "semantic_duplicate"}
-
         # Step 1: Coarse extraction — get raw entities and relations
-        extraction = await self._extract_raw(message, working_memory)
+        extraction = await self._extract_raw(message, working_memory, evaluation)
         raw_entities = extraction.get("entities", [])
         raw_relations = extraction.get("relations", [])
 
@@ -351,30 +346,43 @@ class Encoder:
         Returns:
             Dict with keys: type="log", file_path, log_date, target_entity_updated
         """
-        target_entity = evaluation.get("target_entity")
+        fuzzy_entities = evaluation.get("target_entities") or []
 
-        # Write log to file and update graph
+        # 4-way mapping: fuzzy entity names → precise graph nodes
+        mapped_nodes: Dict[str, List[Node]] = {}
+        if fuzzy_entities:
+            mapped_nodes = await self._map_entities_to_nodes(
+                fuzzy_entities, tenant_id, user_id, context=message
+            )
+
+        # Resolve precise names for log_writer (use best-matched node name, else original)
+        precise_names = []
+        for name in fuzzy_entities:
+            nodes = mapped_nodes.get(name, [])
+            precise_names.append(nodes[0].name if nodes else name)
+
+        primary_entity = precise_names[0] if precise_names else None
+
+        # Write log to file and update graph index
         result = await self.log_writer.write_log(
             category=category,
             message=message,
-            target_entity=target_entity,
+            target_entity=primary_entity,
             tenant_id=tenant_id,
             user_id=user_id,
         )
 
-        # Also write a summary record to buffer so retriever can find it
-        # Buffer stores the rewrite (high-density), not raw details
         file_path = result.get("file_path", "")
-        summary_for_buffer = message
-        if target_entity:
-            summary_for_buffer = f"[{target_entity}] {message} (详见: {file_path})"
+        entity_label = "、".join(precise_names) if precise_names else ""
+        summary_for_buffer = f"[{entity_label}] {message} (详见: {file_path})" if entity_label else message
 
         buffer_unit = {
-            "id": str(__import__('uuid').uuid4()),
+            "id": str(uuid.uuid4()),
             "type": "log_index",
             "message": summary_for_buffer,
             "category": category,
-            "target_entity": target_entity,
+            "target_entities": precise_names,
+            "fuzzy_entities": fuzzy_entities,
             "file_path": file_path,
             "entities": [],
             "relations": [],
@@ -384,14 +392,14 @@ class Encoder:
         self.buffer.write(tenant_id, user_id, session_id, buffer_unit)
 
         logger.info(
-            "Encoded log entry (category=%s, target=%s, file=%s, buffer=yes)",
-            category, target_entity, file_path
+            "Encoded log entry (category=%s, precise_targets=%s, file=%s)",
+            category, precise_names, file_path
         )
 
         return {
             "type": "log",
             "category": category,
-            "target_entity": target_entity,
+            "target_entities": precise_names,
             "file_path": result.get("file_path"),
             "log_date": result.get("log_date"),
             "target_entity_updated": result.get("target_entity_updated"),
@@ -420,102 +428,96 @@ class Encoder:
         Returns:
             Dict with keys: type="reconsolidation", nodes_updated, correction_type
         """
-        target_entity = evaluation.get("target_entity")
+        target_entities = evaluation.get("target_entities") or []
         correction_type = evaluation.get("correction_type", "correct")
 
-        if not target_entity:
-            logger.warning("Reconsolidation missing target_entity, skipping")
-            return {"skipped": True, "reason": "missing_target_entity"}
+        if not target_entities:
+            logger.warning("Reconsolidation missing target_entities, skipping")
+            return {"skipped": True, "reason": "missing_target_entities"}
 
-        # Step 1: Find the target node(s) by name or fuzzy match
-        nodes = await self.graph.find_nodes_by_name(target_entity, tenant_id, user_id)
-        if not nodes:
-            # Try fuzzy search
-            nodes = await self.graph.find_nodes_fuzzy(target_entity, tenant_id, user_id)
-
-        if not nodes:
-            # Auto-create the target entity if it doesn't exist
-            # (reconsolidation implies the user believes this entity should exist)
-            logger.info("Target entity '%s' not found, auto-creating for reconsolidation", target_entity)
-            from server.models.node import Node as NodeModel
-            new_node = NodeModel(
-                name=target_entity,
-                tags=["计划"],
-                summary=message[:100],
-                zone="semantic",
-                importance=6.0,
-            )
-            node = await self.graph.create_node(new_node, tenant_id, user_id)
-            nodes = [node]
-
-        # Use the first matching node (most relevant)
-        node = nodes[0]
-        node_id = node.id
-
-        # Step 2: Prepare updates based on correction_type
-        updates = {}
-        old_values = {}
-
-        if correction_type == "correct":
-            # Factual correction: update summary/content
-            old_values["summary"] = node.summary
-            old_values["content"] = node.content
-            updates["summary"] = message
-            updates["content"] = message
-
-        elif correction_type == "supplement":
-            # Supplement: append to existing content
-            old_values["content"] = node.content
-            new_content = f"{node.content}\n{message}" if node.content else message
-            updates["content"] = new_content
-            # Also update summary to reflect the supplement
-            updates["summary"] = f"{node.summary} | {message[:50]}" if node.summary else message[:50]
-
-        elif correction_type == "reframe":
-            # Emotional reframe: update emotional_tag
-            old_values["emotional_tag"] = node.emotional_tag
-            # Use LLM to extract new emotional tag from message
-            new_emotion = await self._extract_emotion(message)
-            updates["emotional_tag"] = new_emotion
-
-        # Step 3: Record correction history in properties
-        correction_history = node.properties.get("_correction_history", [])
-        correction_history.append({
-            "timestamp": datetime.utcnow().isoformat(),
-            "correction_type": correction_type,
-            "old_values": old_values,
-            "message": message,
-            "session_id": session_id,
-        })
-
-        # Limit history to last 10 corrections
-        if len(correction_history) > 10:
-            correction_history = correction_history[-10:]
-
-        updates["properties"] = {
-            **node.properties,
-            "_correction_history": correction_history,
-        }
-
-        # Step 4: Increment version
-        updates["version"] = node.version + 1
-
-        # Step 5: Update the node
-        await self.graph.update_node(node_id, updates)
-
-        logger.info(
-            "Reconsolidation: updated node %s (entity=%s, type=%s, version=%d→%d)",
-            node_id[:8], target_entity, correction_type, node.version, node.version + 1
+        # 4-way mapping: fuzzy entity names → precise graph nodes
+        mapped_nodes = await self._map_entities_to_nodes(
+            target_entities, tenant_id, user_id, context=message
         )
+
+        results = []
+        for target_entity in target_entities:
+            # Use best-matched node from 4-way mapping
+            nodes = mapped_nodes.get(target_entity, [])
+
+            if not nodes:
+                # Auto-create the target entity if it doesn't exist
+                logger.info("Target entity '%s' not found, auto-creating for reconsolidation", target_entity)
+                from server.models.node import Node as NodeModel
+                new_node = NodeModel(
+                    name=target_entity,
+                    tags=["计划"],
+                    summary=message[:100],
+                    zone="semantic",
+                    importance=6.0,
+                )
+                node = await self.graph.create_node(new_node, tenant_id, user_id)
+                nodes = [node]
+
+            # Use the first matching node (most relevant)
+            node = nodes[0]
+            node_id = node.id
+
+            # Step 2: Prepare updates based on correction_type
+            updates = {}
+            old_values = {}
+
+            if correction_type == "correct":
+                old_values["summary"] = node.summary
+                old_values["content"] = node.content
+                updates["summary"] = message
+                updates["content"] = message
+
+            elif correction_type == "supplement":
+                old_values["content"] = node.content
+                new_content = f"{node.content}\n{message}" if node.content else message
+                updates["content"] = new_content
+                updates["summary"] = f"{node.summary} | {message[:50]}" if node.summary else message[:50]
+
+            elif correction_type == "reframe":
+                old_values["emotional_tag"] = node.emotional_tag
+                new_emotion = await self._extract_emotion(message)
+                updates["emotional_tag"] = new_emotion
+
+            # Step 3: Record correction history in properties
+            correction_history = node.properties.get("_correction_history", [])
+            correction_history.append({
+                "timestamp": datetime.utcnow().isoformat(),
+                "correction_type": correction_type,
+                "old_values": old_values,
+                "message": message,
+                "session_id": session_id,
+            })
+            if len(correction_history) > 10:
+                correction_history = correction_history[-10:]
+
+            updates["properties"] = {**node.properties, "_correction_history": correction_history}
+
+            # Step 4: Increment version and update
+            updates["version"] = node.version + 1
+            await self.graph.update_node(node_id, updates)
+
+            logger.info(
+                "Reconsolidation: updated node %s (entity=%s, type=%s, version=%d→%d)",
+                node_id[:8], target_entity, correction_type, node.version, node.version + 1
+            )
+            results.append({
+                "node_id": node_id,
+                "target_entity": target_entity,
+                "old_version": node.version,
+                "new_version": node.version + 1,
+            })
 
         return {
             "type": "reconsolidation",
-            "node_id": node_id,
-            "target_entity": target_entity,
             "correction_type": correction_type,
-            "nodes_updated": 1,
-            "old_version": node.version,
-            "new_version": node.version + 1,
+            "nodes_updated": len(results),
+            "results": results,
             "session_id": session_id,
             "timestamp": datetime.utcnow().isoformat(),
         }
@@ -544,10 +546,24 @@ class Encoder:
         trigger_type = evaluation.get("trigger_type")
         trigger_value = evaluation.get("trigger_value")
         action = evaluation.get("action")
+        fuzzy_entities = evaluation.get("target_entities") or []
 
         if not trigger_type or not trigger_value or not action:
             logger.warning("Prospective memory missing required fields, skipping")
             return {"skipped": True, "reason": "missing_required_fields"}
+
+        # 4-way mapping: map entities mentioned in the reminder to precise graph nodes
+        linked_node_ids: List[str] = []
+        linked_node_names: List[str] = []
+        if fuzzy_entities:
+            mapped_nodes = await self._map_entities_to_nodes(
+                fuzzy_entities, tenant_id, user_id, context=message
+            )
+            for name in fuzzy_entities:
+                nodes = mapped_nodes.get(name, [])
+                if nodes:
+                    linked_node_ids.append(nodes[0].id)
+                    linked_node_names.append(nodes[0].name)
 
         # Create a memory node for the prospective memory
         node_id = str(uuid.uuid4())
@@ -558,7 +574,7 @@ class Encoder:
             zone="procedural",
             summary=f"{trigger_type}触发器: {action}",
             content=message,
-            importance=8.0,  # High importance for reminders
+            importance=8.0,
             properties={
                 "trigger_type": trigger_type,
                 "trigger_value": trigger_value,
@@ -566,11 +582,26 @@ class Encoder:
                 "status": "pending",
                 "created_from": message,
                 "session_id": session_id,
+                "linked_entities": linked_node_names,
             },
         )
 
-        # Write directly to graph (bypass buffer/consolidation for immediate availability)
+        # Write directly to graph (immediate availability, no buffer consolidation)
         await self.graph.create_node(node, tenant_id, user_id)
+
+        # Create RELATED_TO relations to all linked entities
+        from server.models.relation import Relation
+        for linked_id in linked_node_ids:
+            try:
+                rel = Relation(
+                    from_id=node_id,
+                    to_id=linked_id,
+                    type="RELATED_TO",
+                    description=f"提醒事项涉及此实体",
+                )
+                await self.graph.create_relation(rel)
+            except Exception as rel_err:
+                logger.warning("Failed to create relation for prospective node: %s", rel_err)
 
         # Also write to buffer for retriever discoverability
         buffer_unit = {
@@ -582,7 +613,7 @@ class Encoder:
             "trigger_value": trigger_value,
             "action": action,
             "node_id": node_id,
-            "entities": [],
+            "entities": [{"name": n} for n in linked_node_names],
             "relations": [],
             "importance": 8.0,
             "timestamp": datetime.utcnow().isoformat(),
@@ -590,8 +621,8 @@ class Encoder:
         self.buffer.write(tenant_id, user_id, session_id, buffer_unit)
 
         logger.info(
-            "Encoded prospective memory (type=%s, trigger=%s, action=%s, node=%s)",
-            trigger_type, trigger_value, action, node_id[:8]
+            "Encoded prospective memory (type=%s, trigger=%s, action=%s, node=%s, linked=%s)",
+            trigger_type, trigger_value, action, node_id[:8], linked_node_names
         )
 
         return {
@@ -600,6 +631,7 @@ class Encoder:
             "trigger_type": trigger_type,
             "trigger_value": trigger_value,
             "action": action,
+            "linked_entities": linked_node_names,
             "status": "pending",
             "session_id": session_id,
             "timestamp": datetime.utcnow().isoformat(),
@@ -626,64 +658,63 @@ class Encoder:
         Returns:
             Dict with keys: type="forget", nodes_suppressed, target_entity
         """
-        target_entity = evaluation.get("target_entity")
+        target_entities = evaluation.get("target_entities") or []
 
-        if not target_entity:
-            logger.warning("Forget missing target_entity, skipping")
-            return {"skipped": True, "reason": "missing_target_entity"}
+        if not target_entities:
+            logger.warning("Forget missing target_entities, skipping")
+            return {"skipped": True, "reason": "missing_target_entities"}
 
-        # Step 1: Find the target node(s) by name or fuzzy match
-        nodes = await self.graph.find_nodes_by_name(target_entity, tenant_id, user_id)
-        if not nodes:
-            # Try fuzzy search
-            nodes = await self.graph.find_nodes_fuzzy(target_entity, tenant_id, user_id)
+        # 4-way mapping: fuzzy entity names → precise graph nodes
+        mapped_nodes = await self._map_entities_to_nodes(
+            target_entities, tenant_id, user_id, context=message
+        )
 
-        if not nodes:
-            logger.warning("Target entity '%s' not found for forgetting", target_entity)
-            return {"skipped": True, "reason": "target_entity_not_found", "target_entity": target_entity}
+        total_suppressed = 0
+        all_suppressed_ids = []
 
-        # Step 2: Suppress all matching nodes
-        suppressed_count = 0
-        suppressed_ids = []
+        for target_entity in target_entities:
+            nodes = mapped_nodes.get(target_entity, [])
 
-        for node in nodes:
-            node_id = node.id
-            try:
-                # Update node status to suppressed
-                updates = {
-                    "status": "suppressed",
-                    "retrieval_strength": 0.0,
-                    "properties": {
-                        **node.properties,
-                        "_suppressed_at": datetime.utcnow().isoformat(),
-                        "_suppressed_reason": message,
-                        "_suppressed_session": session_id,
-                    },
-                }
-                await self.graph.update_node(node_id, updates)
-                suppressed_count += 1
-                suppressed_ids.append(node_id)
+            if not nodes:
+                logger.warning("Target entity '%s' not found for forgetting (all 4 methods)", target_entity)
+                continue
 
-                logger.info(
-                    "Suppressed node %s (entity=%s) via forget command",
-                    node_id[:8], node.name
-                )
-            except Exception as e:
-                logger.warning("Failed to suppress node %s: %s", node_id, e)
+            for node in nodes:
+                node_id = node.id
+                try:
+                    updates = {
+                        "status": "suppressed",
+                        "retrieval_strength": 0.0,
+                        "properties": {
+                            **node.properties,
+                            "_suppressed_at": datetime.utcnow().isoformat(),
+                            "_suppressed_reason": message,
+                            "_suppressed_session": session_id,
+                        },
+                    }
+                    await self.graph.update_node(node_id, updates)
+                    total_suppressed += 1
+                    all_suppressed_ids.append(node_id)
+                    logger.info(
+                        "Suppressed node %s (entity=%s) via forget command",
+                        node_id[:8], node.name
+                    )
+                except Exception as e:
+                    logger.warning("Failed to suppress node %s: %s", node_id, e)
 
-        if suppressed_count == 0:
-            return {"skipped": True, "reason": "suppression_failed", "target_entity": target_entity}
+        if total_suppressed == 0:
+            return {"skipped": True, "reason": "suppression_failed", "target_entities": target_entities}
 
         logger.info(
-            "Forget: suppressed %d nodes (entity=%s)",
-            suppressed_count, target_entity
+            "Forget: suppressed %d nodes (entities=%s)",
+            total_suppressed, target_entities
         )
 
         return {
             "type": "forget",
-            "target_entity": target_entity,
-            "nodes_suppressed": suppressed_count,
-            "suppressed_ids": suppressed_ids,
+            "target_entities": target_entities,
+            "nodes_suppressed": total_suppressed,
+            "suppressed_ids": all_suppressed_ids,
             "session_id": session_id,
             "timestamp": datetime.utcnow().isoformat(),
         }
@@ -768,98 +799,136 @@ Return ONLY valid JSON:
         return summary_unit
 
     # ------------------------------------------------------------------
-    # Step 0: Semantic deduplication
+    # 模糊实体 → 精确图谱节点 映射（4路并行）
     # ------------------------------------------------------------------
 
-    async def _is_semantic_duplicate(
+    async def _map_entities_to_nodes(
         self,
-        message: str,
-        recent_units: List[Dict[str, Any]],
-    ) -> bool:
+        entity_names: List[str],
+        tenant_id: str,
+        user_id: str,
+        context: str = "",
+    ) -> Dict[str, List[Node]]:
         """
-        Hybrid semantic deduplication:
-        1. Quick keyword overlap filter (70%+ overlap → likely duplicate)
-        2. For borderline cases (40-70%), use LLM to judge
+        将感知器提取的模糊实体名映射到图谱中的精确节点，4路并行：
+          1. 精确名称召回 (find_nodes_by_name)
+          2. 模糊名称召回 (find_nodes_fuzzy)
+          3. 向量相似度召回 (vector_search)
+          4. LLM判断 (对方法1-3未命中的实体，传入全量节点名称由LLM判断)
+
+        Returns:
+            {entity_name: [Node, ...]}  按置信度排列，最高置信在前。
+            未找到匹配时对应 []。
         """
-        if not recent_units:
-            return False
+        if not entity_names:
+            return {}
 
-        msg_words = set(self._tokenize_chinese(message))
-        if len(msg_words) < 3:
-            # Too short to meaningfully compare
-            return False
+        async def _vector_search_for(name: str) -> List[Node]:
+            try:
+                from server.engine.embedding_client import get_embedding
+                emb = await get_embedding(name, type_="db")
+                raw = await self.graph.vector_search(emb, top_k=5, min_score=0.72)
+                nodes = []
+                for r in raw:
+                    node_dict = r.get("node", {})
+                    # 过滤租户隔离
+                    if node_dict.get("tenant_id") != tenant_id or node_dict.get("user_id") != user_id:
+                        continue
+                    if node_dict.get("status") == "suppressed":
+                        continue
+                    try:
+                        nodes.append(Node.from_neo4j_props(node_dict))
+                    except Exception:
+                        pass
+                return nodes
+            except Exception:
+                return []
 
-        borderline_candidates = []
+        async def _search_one(name: str) -> Tuple[str, List[Node]]:
+            exact, fuzzy, vector = await asyncio.gather(
+                self.graph.find_nodes_by_name(name, tenant_id, user_id),
+                self.graph.find_nodes_fuzzy(name, tenant_id, user_id),
+                _vector_search_for(name),
+            )
+            seen: Dict[str, Tuple[Node, int]] = {}
+            # 优先级：精确(0) > 模糊(1) > 向量(2)
+            for priority, nodes in enumerate([exact, fuzzy, vector]):
+                for node in nodes:
+                    if node.id not in seen:
+                        seen[node.id] = (node, priority)
+            ranked = sorted(seen.values(), key=lambda x: x[1])
+            return name, [n for n, _ in ranked]
 
-        for unit in recent_units:
-            existing_msg = unit.get("message", "").strip()
-            if not existing_msg:
-                continue
+        # 所有实体并行执行方法1-3
+        results = await asyncio.gather(*[_search_one(name) for name in entity_names])
+        mapping: Dict[str, List[Node]] = dict(results)
 
-            # Exact match
-            if existing_msg == message:
-                return True
+        # 方法4：对1-3均未命中的实体，用LLM在全量节点名称中判断
+        unresolved = [name for name, nodes in mapping.items() if not nodes]
+        if unresolved:
+            try:
+                all_nodes = await self.graph.find_active_nodes(tenant_id, user_id)
+                all_node_names = [n.name for n in all_nodes]
+                all_nodes_by_name = {n.name: n for n in all_nodes}
+                if all_node_names:
+                    llm_matches = await self._llm_entity_name_judgment(
+                        unresolved, all_node_names, context
+                    )
+                    for entity_name, matched_names in llm_matches.items():
+                        nodes = [all_nodes_by_name[n] for n in matched_names if n in all_nodes_by_name]
+                        if nodes:
+                            mapping[entity_name] = nodes
+                            logger.debug(
+                                "LLM mapped entity '%s' → %s",
+                                entity_name, [n.name for n in nodes]
+                            )
+            except Exception as e:
+                logger.warning("LLM entity name judgment failed: %s", e)
 
-            existing_words = set(self._tokenize_chinese(existing_msg))
-            if len(existing_words) < 3:
-                continue
+        return mapping
 
-            # Keyword overlap ratio
-            overlap = len(msg_words & existing_words)
-            union = len(msg_words | existing_words)
-            ratio = overlap / union if union > 0 else 0
-
-            if ratio >= 0.7:
-                # High overlap → definitely duplicate
-                logger.debug("High keyword overlap (%.2f) with existing message", ratio)
-                return True
-            elif 0.4 <= ratio < 0.7:
-                # Borderline → need LLM check
-                borderline_candidates.append(existing_msg)
-
-        # LLM check for borderline cases
-        if borderline_candidates:
-            return await self._llm_similarity_check(message, borderline_candidates[:3])
-
-        return False
-
-    @staticmethod
-    def _tokenize_chinese(text: str) -> List[str]:
-        """Simple Chinese tokenization: split by whitespace + punctuation, keep CJK chars."""
-        import re
-        # Remove punctuation, split by whitespace
-        tokens = re.findall(r'[\w]+', text.lower())
-        return [t for t in tokens if len(t) > 1]  # Filter single chars
-
-    async def _llm_similarity_check(
+    async def _llm_entity_name_judgment(
         self,
-        new_message: str,
-        existing_messages: List[str],
-    ) -> bool:
-        """Use LLM to judge if new_message is semantically duplicate of any existing message."""
-        existing_list = "\n".join(f"{i+1}. {msg}" for i, msg in enumerate(existing_messages))
+        fuzzy_names: List[str],
+        all_node_names: List[str],
+        context: str = "",
+    ) -> Dict[str, List[str]]:
+        """
+        LLM批量判断：给定模糊实体列表和图谱全量节点名称，返回匹配关系。
+        处理全称/简称/昵称/称谓等变体。
+        """
+        # 节点名称过多时截断，避免 token 爆炸
+        node_list_text = "\n".join(f"- {n}" for n in all_node_names)
+        context_line = f"\n上下文: {context[:200]}" if context else ""
+
         system_prompt = """\
-You are a semantic similarity judge. Determine if the new message is semantically \
-duplicate (same core meaning) as any of the existing messages.
+你是知识图谱实体名称匹配专家。
+给定一组从用户消息中提取的模糊实体名称，以及图谱中所有已有节点名称，
+判断哪些已有节点与哪些模糊实体是同一个实体。
+考虑：全称/简称、昵称/真名、称谓变体（如"凡哥"对应"刘凡"）、中英文混用。
 
-Return ONLY valid JSON:
+返回格式（仅JSON）：
 {
-  "is_duplicate": true|false,
-  "reason": "one-sentence explanation"
+  "matches": {
+    "模糊实体名": ["匹配的节点名1", "匹配的节点名2"],
+    ...
+  }
 }
+没有把握的匹配返回空列表 []，宁缺毋滥。
 """
         user_prompt = (
-            f"New message:\n\"{new_message}\"\n\n"
-            f"Existing messages:\n{existing_list}\n\n"
-            f"Is the new message a semantic duplicate of any existing message?"
+            f"模糊实体（需要映射）：\n{json.dumps(fuzzy_names, ensure_ascii=False)}"
+            f"\n\n图谱已有节点名称：\n{node_list_text}"
+            f"{context_line}"
         )
 
         try:
             result = await call_llm_json(system_prompt, user_prompt, temperature=0.1)
-            return bool(result.get("is_duplicate", False))
+            matches = result.get("matches", {})
+            return {k: v if isinstance(v, list) else [] for k, v in matches.items()}
         except Exception as e:
-            logger.warning("LLM similarity check failed: %s", e)
-            return False  # Fail-open: allow encoding if LLM fails
+            logger.warning("_llm_entity_name_judgment failed: %s", e)
+            return {}
 
     # ------------------------------------------------------------------
     # Entity filtering
@@ -893,120 +962,120 @@ Return ONLY valid JSON:
         if not raw_entities:
             return []
 
-        # Step 1: For each candidate, find related existing entities in graph
-        existing_entities_map = {}
+        # Step 1: 4路并行召回每个候选实体的相关图谱节点
+        # （精确名称 + 模糊名称 + 向量相似度 + LLM判断）
+        entity_names = [e.get("name", "") for e in raw_entities if e.get("name")]
+        mapped_nodes = await self._map_entities_to_nodes(
+            entity_names, tenant_id, user_id, context=message_context
+        )
+
+        # 补充标签维度召回（_map_entities_to_nodes 不含 tag 搜索）
+        # 标签召回用于让 LLM 了解图谱中同类实体，辅助 skip 判断
+        tag_candidates: Dict[str, List[Node]] = {}
+        tag_search_tasks = []
+        for entity in raw_entities:
+            tags = entity.get("tags", [])
+            name = entity.get("name", "")
+            if tags:
+                tag_search_tasks.append((name, self.graph.find_nodes_by_tags(tags, tenant_id, user_id)))
+        if tag_search_tasks:
+            tag_results = await asyncio.gather(*[t for _, t in tag_search_tasks], return_exceptions=True)
+            for (name, _), result in zip(tag_search_tasks, tag_results):
+                if not isinstance(result, Exception):
+                    tag_candidates[name] = [n for n in result if n.status == "active"][:3]
+
+        # 合并：4路召回结果 + 标签召回，去重，每实体限5个候选
+        existing_entities_map: Dict[str, List[Node]] = {}
         for entity in raw_entities:
             name = entity.get("name", "")
-            tags = entity.get("tags", [])
-
-            # Search by name
-            by_name = await self.graph.find_nodes_by_name(name, tenant_id, user_id)
-            # Search by fuzzy match
-            by_fuzzy = await self.graph.find_nodes_fuzzy(name, tenant_id, user_id)
-            # Search by tags
-            by_tags = []
-            if tags:
-                by_tags = await self.graph.find_nodes_by_tags(tags, tenant_id, user_id)
-
-            # Combine and deduplicate (limit to top 5 most relevant)
-            seen_ids = set()
-            related = []
-            for node in by_name + by_fuzzy + by_tags:
-                if node.id not in seen_ids and node.status == "active":
+            seen_ids: set = set()
+            merged: List[Node] = []
+            for node in (mapped_nodes.get(name, []) + tag_candidates.get(name, [])):
+                if node.id not in seen_ids and len(merged) < 5:
                     seen_ids.add(node.id)
-                    related.append(node)
-                    if len(related) >= 5:
-                        break
+                    merged.append(node)
+            existing_entities_map[name] = merged
 
-            existing_entities_map[name] = related
-
-        # Step 2: Build LLM prompt
-        candidates_json = []
-        for entity in raw_entities:
-            candidates_json.append({
-                "name": entity.get("name", ""),
-                "tags": entity.get("tags", []),
-                "summary": entity.get("summary", ""),
-            })
-
-        existing_json = {}
-        for name, nodes in existing_entities_map.items():
-            existing_json[name] = [
-                {
-                    "name": node.name,
-                    "tags": node.tags,
-                    "summary": node.summary or "",
-                    "aliases": node.aliases,
-                }
-                for node in nodes
+        # Step 2: 构建 LLM prompt
+        candidates_json = [
+            {"name": e.get("name", ""), "tags": e.get("tags", []), "summary": e.get("summary", "")}
+            for e in raw_entities
+        ]
+        existing_json = {
+            name: [
+                {"name": n.name, "tags": n.tags, "summary": n.summary or "", "aliases": n.aliases}
+                for n in nodes
             ]
+            for name, nodes in existing_entities_map.items()
+        }
 
         system_prompt = """\
-You are a knowledge graph entity management expert. The user's message produced candidate entities. \
-For each candidate, decide how to handle it.
+你是知识图谱实体管理专家。用户消息产生了一批候选实体，你需要决定每个实体如何处理。
 
-Return ONLY valid JSON array:
+## 决策选项
+
+**create** — 真正的新实体，图谱中不存在
+**merge** — 与已有实体是同一个（含昵称、简称、称谓变体，如"凡哥"→"刘凡"）
+  必须指定 target（已有实体名称）
+**update** — 已有实体，但本次提及带来了新信息
+  必须指定 target（已有实体名称）
+**skip** — 不值得入图谱，包括：
+  - 纯数字、单位（"600大卡"、"90kg"、"5公里"）
+  - 具体食物（"苹果"、"牛肉面"）— 属于日志，不是知识图谱实体
+  - 通用常识（"地球"、"太阳"、"Python语言"本身）
+  - 临时调试信息
+  - 代词（"我"、"用户"）若用户节点已存在
+
+## 判断原则
+- 人物、组织、项目、计划、决策、里程碑 → 通常 create 或 update
+- 食物、数字、通用概念 → 通常 skip
+- 有名称变体匹配（昵称/全称/别名）→ 优先 merge，不要重复创建
+- 有新信息但实体已存在 → update，不要 create
+- 不确定 → skip（防止图谱膨胀）
+
+## 返回格式（仅 JSON 数组）
 [
   {
-    "name": "entity name",
+    "name": "候选实体名",
     "decision": "create|merge|update|skip",
-    "target": "target entity name (for merge/update) or null",
-    "reason": "brief reason"
+    "target": "目标已有实体名（merge/update时必填，其余为null）",
+    "reason": "一句话理由"
   }
 ]
-
-Decisions:
-1. "create" — New, valuable entity not in graph
-2. "merge" — Same as existing entity (including pronouns like "我/用户" referring to user)
-   - Specify merge_target (existing entity name)
-3. "update" — New information for existing entity
-   - Specify update_target (existing entity name)
-4. "skip" — Not worth adding to graph:
-   - Pure numbers ("600大卡", "90kg", "5公里")
-   - Specific food items ("苹果", "牛肉面") — these belong in diet logs
-   - Universal concepts (LLM already knows, like "地球", "太阳")
-   - Debug/test temporary info
-   - Pronouns ("我", "用户") if user node already exists
-
-Principles:
-- Prefer skip over creating low-value nodes
-- Prefer merge over creating duplicate nodes
-- People, organizations, projects, plans, decisions, milestones → usually create or update
-- Food, numbers, universal concepts → usually skip
-- When uncertain → skip (prevent graph bloat)
 """
 
-        user_prompt = f"""\
-User message context: "{message_context}"
+        user_prompt = (
+            f'用户消息上下文："{message_context}"\n\n'
+            f"候选实体：\n{json.dumps(candidates_json, ensure_ascii=False, indent=2)}\n\n"
+            f"图谱中相关已有实体（4路召回结果）：\n{json.dumps(existing_json, ensure_ascii=False, indent=2)}"
+        )
 
-Candidate entities:
-{json.dumps(candidates_json, ensure_ascii=False, indent=2)}
-
-Related existing entities in graph:
-{json.dumps(existing_json, ensure_ascii=False, indent=2)}
-"""
-
-        # Step 3: Call LLM
+        # Step 3: LLM 判断
         try:
-            result = await call_llm_json(system_prompt, user_prompt, temperature=0.2)
+            result = await call_llm_json(system_prompt, user_prompt, temperature=0.1)
             decisions = result if isinstance(result, list) else result.get("decisions", [])
-        except Exception as e:
-            logger.error("LLM entity resolution failed: %s. Defaulting to skip all.", e)
-            # Fallback: skip all entities on error (防误杀)
+        except Exception as exc:
+            logger.error("LLM entity resolution failed: %s. Defaulting to skip all.", exc)
             decisions = [
                 {"name": e.get("name", ""), "decision": "skip", "target": None, "reason": "LLM error"}
                 for e in raw_entities
             ]
 
-        # Step 4: Attach decisions to entities
+        # Step 4: 附加决策并过滤掉 skip 实体
+        # 同时将已召回的目标 Node 挂到 entity 上，供 _resolve_entity 直接复用，避免重复查询
         decision_map = {d.get("name", ""): d for d in decisions}
         resolved = []
         for entity in raw_entities:
             name = entity.get("name", "")
             decision = decision_map.get(name, {"decision": "skip", "target": None, "reason": "no decision"})
             entity["resolution"] = decision
-
-            # Only keep entities that are not skipped
+            # 对 merge/update，把已召回的目标 Node 缓存到 entity 上
+            target_name = decision.get("target") or ""
+            if decision.get("decision") in ("merge", "update") and target_name:
+                for node in existing_entities_map.get(name, []):
+                    if node.name == target_name:
+                        entity["_resolved_node"] = node
+                        break
             if decision.get("decision") != "skip":
                 resolved.append(entity)
             else:
@@ -1042,16 +1111,16 @@ Related existing entities in graph:
             if matches:
                 return matches[0]
 
-            # 3. Substring match (check if entity_name is contained in any existing node name)
+            # 3. Substring match — 收紧条件：短串至少3字符，且长度占比 >= 50%
             all_nodes = await self.graph.find_active_nodes(tenant_id, user_id)
             entity_lower = entity_name.lower()
 
             for node in all_nodes:
                 node_lower = node.name.lower()
-                # Check if one is substring of the other
                 if entity_lower in node_lower or node_lower in entity_lower:
-                    # Only match if similarity is high enough
-                    if len(entity_lower) >= 2 and len(node_lower) >= 2:
+                    shorter = min(len(entity_lower), len(node_lower))
+                    longer = max(len(entity_lower), len(node_lower))
+                    if shorter >= 3 and shorter / longer >= 0.5:
                         logger.debug("Substring match found: '%s' <-> '%s'", entity_name, node.name)
                         return node
 
@@ -1069,13 +1138,41 @@ Related existing entities in graph:
         self,
         message: str,
         working_memory: Optional[Dict[str, Any]],
+        evaluation: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """LLM粗提取：从消息中提取原始实体和关系。"""
-        context_hint = ""
-        if working_memory and working_memory.get("context"):
-            context_hint = f"\nSession context:\n{working_memory['context'][:400]}"
+        """LLM粗提取：从消息中提取原始实体和关系，利用 perceiver/evaluator 的全部上下文。"""
+        context_parts = []
 
-        user_prompt = f'Message:\n"""\n{message}\n"""{context_hint}'
+        if working_memory:
+            raw = working_memory.get("raw", {})
+            profile = raw.get("user_profile", {})
+            if profile:
+                context_parts.append(f"用户画像: {profile}")
+            if working_memory.get("user_goals"):
+                goals = "; ".join(working_memory["user_goals"])
+                context_parts.append(f"活跃目标: {goals}")
+            events = raw.get("recent_events", [])
+            if events:
+                ev_text = "; ".join(e.get("summary") or e.get("name", "") for e in events[:5])
+                context_parts.append(f"近期事件: {ev_text}")
+            session_msgs = working_memory.get("session_messages", [])
+            if session_msgs:
+                lines = " | ".join(session_msgs[-3:])
+                context_parts.append(f"本session上文: {lines}")
+
+        if evaluation:
+            hint_entities = evaluation.get("target_entities") or []
+            if hint_entities:
+                context_parts.append(f"感知器已提取的模糊实体（提取时应重点关注）: {hint_entities}")
+            category = evaluation.get("category", "")
+            if category:
+                context_parts.append(f"消息类别: {category}")
+
+        context_block = ""
+        if context_parts:
+            context_block = "\n\n上下文信息（用于消歧和实体解析）：\n" + "\n".join(context_parts)
+
+        user_prompt = f'消息：\n"""\n{message}\n"""{context_block}'
         try:
             return await call_llm_json(_EXTRACT_SYSTEM, user_prompt)
         except Exception as e:
@@ -1093,35 +1190,95 @@ Related existing entities in graph:
         user_id: str,
     ) -> Dict[str, Any]:
         """
-        对单个实体执行完整的解析流程：
-        1. 严格去重检查（新增）
-        2. Tag归属：查tag字典，确定实体应归入哪个tag
-        3. 同类检索：按tag去图谱检索同类实体
-        4. LLM判断：create/merge/update + 关系构建（一次调用）
-        5. 干扰检测：检查是否存在高度相似的旧实体，标记冲突或更新关系
+        对单个实体执行完整解析：Tag归属 + 图谱节点定位 + 关系/别名/属性构建 + 干扰检测。
+
+        优化：复用 _smart_resolve_entities 的先验决策（entity["resolution"]），
+        有先验时直接精确查找目标节点，跳过 strict_dedup_check 和 find_active_nodes 全扫。
         """
         name = raw_entity.get("name", "").strip()
         raw_tags = raw_entity.get("tags", [])
+        prior = raw_entity.get("resolution", {})
+        prior_decision = prior.get("decision", "")
+        prior_target = prior.get("target") or ""
 
-        # --- Step 1: 严格去重检查 ---
-        existing_node = await self._strict_dedup_check(name, tenant_id, user_id)
-        if existing_node:
-            logger.info("Strict dedup: entity '%s' already exists as '%s' (%s), will update",
-                       name, existing_node.name, existing_node.id[:8])
-            return {
-                "action": "update",
-                "final_name": existing_node.name,
-                "resolved_tags": existing_node.tags,
-                "existing_id": existing_node.id,
-                "aliases_to_add": [name] if name != existing_node.name else [],
-                "summary_update": raw_entity.get("summary"),
-                "properties_update": {},
-                "new_relations": [],
-                "reason": "strict dedup match",
-            }
+        # --- Step 1: 定位已有节点（复用先验，避免重复搜索）---
+        same_tag_entities: List[Dict[str, Any]] = []
 
-        # --- Step 2: Tag归属 ---
-        resolved_tags = []
+        if prior_decision in ("merge", "update") and prior_target:
+            # 优先使用 _smart_resolve_entities 已缓存的 Node，避免重复查询
+            cached_node: Optional[Node] = raw_entity.get("_resolved_node")
+            if cached_node is None:
+                # 缓存未命中（target 名称不在召回结果中），降级查询
+                target_nodes = await self.graph.find_nodes_by_name(prior_target, tenant_id, user_id)
+                if not target_nodes:
+                    target_nodes = await self.graph.find_nodes_fuzzy(prior_target, tenant_id, user_id)
+                cached_node = target_nodes[0] if target_nodes else None
+
+            if cached_node:
+                same_tag_entities = [{
+                    "name": cached_node.name,
+                    "tags": cached_node.tags,
+                    "zone": cached_node.zone,
+                    "summary": cached_node.summary or "",
+                    "id": cached_node.id,
+                    "aliases": (cached_node.properties or {}).get("aliases", []),
+                }]
+                logger.debug(
+                    "Prior resolution '%s'→'%s': found node %s (cached=%s)",
+                    name, prior_target, cached_node.id[:8],
+                    raw_entity.get("_resolved_node") is not None,
+                )
+            else:
+                # 先验目标未找到，降级为 create
+                logger.info("Prior target '%s' not found in graph, falling back to create", prior_target)
+                prior_decision = "create"
+
+        elif prior_decision == "create":
+            # 先验已明确新实体 → 跳过所有搜索
+            pass
+
+        else:
+            # 无先验（兜底）：原始 strict_dedup_check + 全量扫描
+            fallback_existing_node = await self._strict_dedup_check(name, tenant_id, user_id)
+            if fallback_existing_node:
+                logger.info("Strict dedup: '%s' → '%s' (%s), will update",
+                            name, fallback_existing_node.name, fallback_existing_node.id[:8])
+                return {
+                    "action": "update",
+                    "final_name": fallback_existing_node.name,
+                    "resolved_tags": fallback_existing_node.tags,
+                    "existing_id": fallback_existing_node.id,
+                    "aliases_to_add": [name] if name != fallback_existing_node.name else [],
+                    "summary_update": raw_entity.get("summary"),
+                    "properties_update": {},
+                    "new_relations": [],
+                    "reason": "strict dedup match",
+                }
+            # 全量扫描：按 tag overlap 或名称相似性过滤
+            try:
+                all_nodes = await self.graph.find_active_nodes(tenant_id, user_id)
+                name_lower = name.lower()
+                for node in all_nodes:
+                    has_tag_overlap = bool(set(node.tags or []) & set(raw_tags))
+                    node_name_lower = node.name.lower()
+                    has_name_sim = (
+                        name_lower in node_name_lower or
+                        node_name_lower in name_lower
+                    )
+                    if has_tag_overlap or has_name_sim:
+                        same_tag_entities.append({
+                            "name": node.name,
+                            "tags": node.tags,
+                            "zone": node.zone,
+                            "summary": node.summary or "",
+                            "id": node.id,
+                            "aliases": (node.properties or {}).get("aliases", []),
+                        })
+            except Exception as e:
+                logger.warning("Failed to fetch same-tag entities: %s", e)
+
+        # --- Step 2: Tag 归属（始终执行）---
+        resolved_tags: List[str] = []
         for tag in raw_tags:
             similar = await self.tag_dict.find_similar(tag)
             if similar:
@@ -1133,44 +1290,13 @@ Related existing entities in graph:
                 resolved_tags.append(canonical)
                 self.tag_dict.increment_usage(canonical)
             else:
-                # No match — but don't blindly add. Check if it's too specific.
-                # For now, add it but the LLM resolve step may override.
                 new_tag = self.tag_dict.add_tag(tag)
                 resolved_tags.append(new_tag.name)
                 self.tag_dict.increment_usage(new_tag.name)
 
-        # --- Step 3: 按tag检索同类实体 + 按名称模糊匹配 ---
-        same_tag_entities = []
-        try:
-            all_nodes = await self.graph.find_active_nodes(tenant_id, user_id)
-            for node in all_nodes:
-                node_tags = set(node.tags or [])
-                node_name_lower = node.name.lower()
-                name_lower = name.lower()
-
-                # Match by tag overlap OR name similarity
-                has_tag_overlap = bool(node_tags & set(resolved_tags))
-                has_name_similarity = (
-                    name_lower in node_name_lower or
-                    node_name_lower in name_lower or
-                    name_lower == node_name_lower
-                )
-
-                if has_tag_overlap or has_name_similarity:
-                    same_tag_entities.append({
-                        "name": node.name,
-                        "tags": node.tags,
-                        "zone": node.zone,
-                        "summary": node.summary or "",
-                        "id": node.id,
-                        "aliases": (node.properties or {}).get("aliases", []),
-                    })
-        except Exception as e:
-            logger.warning("Failed to fetch same-tag entities: %s", e)
-
-        # --- Step 4: LLM一次性判断 ---
-        if not same_tag_entities:
-            # 没有同类实体，直接create
+        # --- Step 3: LLM 详细解析（关系/别名/属性/摘要构建）---
+        if not same_tag_entities and prior_decision != "merge":
+            # 无候选节点且不是 merge → 直接 create
             return {
                 "action": "create",
                 "final_name": name,
@@ -1180,30 +1306,34 @@ Related existing entities in graph:
                 "summary_update": None,
                 "properties_update": {},
                 "new_relations": [],
-                "reason": "no existing entities with matching tags",
+                "reason": prior.get("reason") or "no existing entities found",
             }
 
-        # Build LLM prompt
+        tag_taxonomy = ", ".join(t.name for t in self.tag_dict.get_all_active())
         existing_list = "\n".join(
             f"- {e['name']} (id={e['id'][:8]}, tags={e['tags']}, "
-            f"zone={e['zone']}, summary={e['summary'][:80]}, "
-            f"aliases={e.get('aliases', [])})"
-            for e in same_tag_entities[:15]  # Cap at 15 to avoid token bloat
+            f"zone={e['zone']}, summary={e['summary'][:80]}, aliases={e.get('aliases', [])})"
+            for e in same_tag_entities[:15]
         )
 
-        tag_taxonomy = ", ".join(
-            t.name for t in self.tag_dict.get_all_active()
-        )
+        # 将先验决策注入 prompt，引导 LLM 聚焦关系/别名构建而非重新决策
+        prior_hint = ""
+        if prior_decision in ("merge", "update") and prior_target:
+            prior_hint = (
+                f"\n\n【前置判断】上游已确认此实体应 {prior_decision} 到「{prior_target}」，"
+                f"请在此基础上填写 aliases_to_add / summary_update / new_relations / properties_update，"
+                f"action 字段返回 \"{prior_decision}\"，target_entity_name 返回 \"{prior_target}\"。"
+            )
 
         user_prompt = (
-            f"New entity to resolve:\n"
-            f"  name: \"{name}\"\n"
-            f"  preliminary tags: {raw_tags}\n"
-            f"  zone: {raw_entity.get('zone', 'semantic')}\n"
-            f"  summary: {raw_entity.get('summary', '')}\n\n"
-            f"Existing entities with similar tags:\n{existing_list}\n\n"
-            f"Available tag taxonomy: [{tag_taxonomy}]\n\n"
-            f"Decide: merge into existing, update existing, or create new?"
+            f"待解析实体：\n"
+            f"  名称：\"{name}\"\n"
+            f"  初步标签：{raw_tags}\n"
+            f"  记忆区域：{raw_entity.get('zone', 'semantic')}\n"
+            f"  摘要：{raw_entity.get('summary', '')}\n\n"
+            f"图谱中的候选已有实体：\n{existing_list}\n\n"
+            f"可用标签分类法：[{tag_taxonomy}]"
+            f"{prior_hint}"
         )
 
         try:
@@ -1211,10 +1341,10 @@ Related existing entities in graph:
         except Exception as e:
             logger.warning("Entity resolution LLM failed for '%s': %s", name, e)
             return {
-                "action": "create",
-                "final_name": name,
+                "action": prior_decision if prior_decision in ("create", "merge", "update") else "create",
+                "final_name": prior_target if prior_target else name,
                 "resolved_tags": resolved_tags,
-                "existing_id": None,
+                "existing_id": same_tag_entities[0]["id"] if same_tag_entities else None,
                 "aliases_to_add": [],
                 "summary_update": None,
                 "properties_update": {},
@@ -1222,13 +1352,12 @@ Related existing entities in graph:
                 "reason": f"LLM resolution failed: {e}",
             }
 
-        action = result.get("action", "create")
-        target_name = result.get("target_entity_name")
-        llm_tags = result.get("resolved_tags", resolved_tags)
+        action = result.get("action", prior_decision or "create")
+        target_name = result.get("target_entity_name") or prior_target
 
-        # Standardize LLM-returned tags through tag_dict
-        final_tags = []
-        for t in llm_tags:
+        # Tag 标准化
+        final_tags: List[str] = []
+        for t in result.get("resolved_tags", resolved_tags):
             similar = await self.tag_dict.find_similar(t)
             if similar and similar.status == "active":
                 final_tags.append(similar.name)
@@ -1236,17 +1365,16 @@ Related existing entities in graph:
                 new_tag = self.tag_dict.add_tag(t)
                 final_tags.append(new_tag.name)
 
-        # Find existing_id if merging/updating
+        # 确定 existing_id 和 final_name
         existing_id = None
         final_name = name
         if action in ("merge", "update") and target_name:
             for e in same_tag_entities:
                 if e["name"] == target_name:
                     existing_id = e["id"]
-                    final_name = target_name  # Use the existing entity's name
+                    final_name = target_name
                     break
             if not existing_id:
-                # Target not found, fall back to create
                 action = "create"
                 final_name = name
 
@@ -1262,19 +1390,17 @@ Related existing entities in graph:
             "reason": result.get("reason", ""),
         }
 
-        # --- Step 5: Interference detection ---
-        # Check if this is an update that interferes with old information
+        # --- Step 4: 干扰检测（仅 update）---
         if action == "update" and existing_id:
-            interference_result = await self._check_interference(
+            interference = await self._check_interference(
                 existing_id, raw_entity, resolution_result, tenant_id, user_id
             )
-            # Merge interference results into resolution
-            if interference_result:
+            if interference:
                 resolution_result["properties_update"] = {
                     **resolution_result.get("properties_update", {}),
-                    **interference_result.get("properties_update", {}),
+                    **interference.get("properties_update", {}),
                 }
-                resolution_result["relations_to_invalidate"] = interference_result.get("relations_to_invalidate", [])
+                resolution_result["relations_to_invalidate"] = interference.get("relations_to_invalidate", [])
 
         return resolution_result
 
