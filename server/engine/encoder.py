@@ -141,15 +141,26 @@ _RESOLVE_ENTITY_SYSTEM = """\
 # 会话摘要提示词
 # ---------------------------------------------------------------------------
 _SUMMARY_SYSTEM = """\
-你是AI Agent记忆系统的会话摘要器。将对话总结为简洁的结构化摘要。
+你是AI Agent记忆系统的会话摘要器。根据本次会话中海马体编码产生的记忆单元（memory units），\
+生成结构化的会话摘要。
+
+每个记忆单元包含：
+- message: 经过丘脑重写的高密度语义文本
+- entities: 已解析的实体列表（含 action: create/merge/update/skip）
+- relations: 已解析的关系列表
+- importance: 重要性评分
+- emotion_type / emotional_intensity: 情感信息
+
+请基于这些已编码的结构化数据（而非原始对话）进行总结。
 
 返回格式（仅JSON）：
 {
   "topics": ["话题1", "话题2"],
+  "key_entities": ["本次涉及的关键实体名"],
   "key_conclusions": ["结论1"],
   "pending_points": ["未解决1"],
   "emotional_arc": "positive|negative|neutral|mixed",
-  "summary_text": "2-3句话的摘要"
+  "summary_text": "本次会话中的描述内容, 有条理的将重要信息和背景上下文全部表述清楚。"
 }
 """
 
@@ -251,6 +262,8 @@ class Encoder:
         # Step 2-4: Resolve each entity (tag归属 + 去重 + 关系构建)
         resolved_entities = []
         all_new_relations = list(raw_relations)  # Start with raw relations
+        # Build name mapping: original_name → final_name (for relation fixup)
+        name_mapping: Dict[str, str] = {}
 
         for raw_entity in raw_entities:
             name = raw_entity.get("name", "").strip()
@@ -261,8 +274,13 @@ class Encoder:
                 raw_entity, tenant_id, user_id
             )
 
+            final_name = resolution.get("final_name", name)
+            # Track mapping from original extracted name to resolved name
+            if name != final_name:
+                name_mapping[name] = final_name
+
             resolved_entities.append({
-                "name": resolution.get("final_name", name),
+                "name": final_name,
                 "tags": resolution.get("resolved_tags", raw_entity.get("tags", [])),
                 "zone": raw_entity.get("zone", "semantic"),
                 "summary": resolution.get("summary_update") or raw_entity.get("summary", ""),
@@ -278,6 +296,16 @@ class Encoder:
             # Collect new relations from resolution
             for rel in resolution.get("new_relations", []):
                 all_new_relations.append(rel)
+
+        # Fix P3+P4: Replace alias/raw names in relations with final resolved names
+        if name_mapping:
+            for rel in all_new_relations:
+                from_name = rel.get("from_name", "")
+                to_name = rel.get("to_name", "")
+                if from_name in name_mapping:
+                    rel["from_name"] = name_mapping[from_name]
+                if to_name in name_mapping:
+                    rel["to_name"] = name_mapping[to_name]
 
         # Step 5: Assemble and write memory unit
         importance = self._compute_importance(evaluation)
@@ -756,24 +784,55 @@ Return ONLY valid JSON:
 
     async def generate_session_summary(
         self,
-        conversation_history: List[Dict[str, Any]],
         tenant_id: str,
         user_id: str,
         session_id: str,
     ) -> Dict[str, Any]:
-        """Generate a structured summary for a completed session."""
-        formatted = "\n".join(
-            f"[{msg.get('role', 'user')}]: {msg.get('content', '')}"
-            for msg in conversation_history[-50:]
+        """
+        Generate a structured summary from the buffer's encoded memory units.
+
+        Instead of re-processing raw conversation text, this reads the
+        already-encoded memory units (entities, relations, importance, etc.)
+        produced by the hippocampal encoding pipeline during this session.
+        """
+        # Read all memory units for this session from the buffer
+        session_units = self.buffer.read_by_session(session_id)
+        # Filter to actual memory units (exclude previous summaries)
+        memory_units = [u for u in session_units if u.get("type") == "memory"]
+
+        if not memory_units:
+            logger.info("No memory units in session %s, skipping summary", session_id)
+            return {}
+
+        # Build a compact representation of each unit for the LLM
+        unit_summaries = []
+        for u in memory_units:
+            entity_names = [e.get("name", "") for e in u.get("entities", []) if e.get("action") != "skip"]
+            relation_descs = [
+                f"{r.get('from_name', '?')} --[{r.get('type', '?')}]--> {r.get('to_name', '?')}"
+                for r in u.get("relations", [])
+            ]
+            unit_summaries.append({
+                "message": u.get("message", ""),
+                "entities": entity_names,
+                "relations": relation_descs,
+                "importance": u.get("importance", 0),
+                "emotion": u.get("emotion_type", "neutral"),
+                "emotional_intensity": u.get("emotional_intensity", 0),
+            })
+
+        user_prompt = (
+            f"本次会话共编码 {len(memory_units)} 条记忆单元：\n"
+            f"{json.dumps(unit_summaries, ensure_ascii=False, indent=2)}"
         )
-        user_prompt = f'Conversation to summarize:\n"""\n{formatted}\n"""'
 
         try:
             summary_data = await call_llm_json(_SUMMARY_SYSTEM, user_prompt)
         except Exception as e:
             logger.error("Session summary LLM call failed: %s", e)
             summary_data = {
-                "topics": [], "key_conclusions": [], "pending_points": [],
+                "topics": [], "key_entities": [],
+                "key_conclusions": [], "pending_points": [],
                 "emotional_arc": "neutral", "summary_text": "Summary generation failed.",
             }
 
@@ -784,6 +843,7 @@ Return ONLY valid JSON:
             "tenant_id": tenant_id,
             "user_id": user_id,
             "topics": summary_data.get("topics", []),
+            "key_entities": summary_data.get("key_entities", []),
             "key_conclusions": summary_data.get("key_conclusions", []),
             "pending_points": summary_data.get("pending_points", []),
             "emotional_arc": summary_data.get("emotional_arc", "neutral"),
@@ -795,7 +855,8 @@ Return ONLY valid JSON:
 
         unit_id = self.buffer.write(tenant_id, user_id, session_id, summary_unit)
         summary_unit["id"] = unit_id
-        logger.info("Generated session summary %s for session %s", unit_id, session_id)
+        logger.info("Generated session summary %s for session %s (%d units)",
+                     unit_id, session_id, len(memory_units))
         return summary_unit
 
     # ------------------------------------------------------------------
@@ -969,6 +1030,11 @@ Return ONLY valid JSON:
             entity_names, tenant_id, user_id, context=message_context
         )
 
+        # P6: Also check recent buffer entries for entities not yet in graph
+        # This handles consecutive messages where entity A is encoded but not
+        # yet consolidated, and entity B references A
+        buffer_entities = self._get_recent_buffer_entities(tenant_id, user_id)
+
         # 补充标签维度召回（_map_entities_to_nodes 不含 tag 搜索）
         # 标签召回用于让 LLM 了解图谱中同类实体，辅助 skip 判断
         tag_candidates: Dict[str, List[Node]] = {}
@@ -977,7 +1043,10 @@ Return ONLY valid JSON:
             tags = entity.get("tags", [])
             name = entity.get("name", "")
             if tags:
-                tag_search_tasks.append((name, self.graph.find_nodes_by_tags(tags, tenant_id, user_id)))
+                tag_search_tasks.append((name, self.graph.find_nodes_by_tags(
+                    tags, tenant_id, user_id,
+                    expand_hierarchy=True, tag_dict=self.tag_dict,
+                )))
         if tag_search_tasks:
             tag_results = await asyncio.gather(*[t for _, t in tag_search_tasks], return_exceptions=True)
             for (name, _), result in zip(tag_search_tasks, tag_results):
@@ -1008,6 +1077,23 @@ Return ONLY valid JSON:
             ]
             for name, nodes in existing_entities_map.items()
         }
+        # P6: Inject buffer entities for candidates with no graph matches
+        if buffer_entities:
+            for entity in raw_entities:
+                name = entity.get("name", "")
+                if name and not existing_json.get(name):
+                    # Check if any buffer entity matches this candidate
+                    name_lower = name.lower()
+                    for be in buffer_entities:
+                        be_name = be.get("name", "").lower()
+                        if be_name and (name_lower in be_name or be_name in name_lower):
+                            existing_json.setdefault(name, []).append({
+                                "name": be["name"],
+                                "tags": be.get("tags", []),
+                                "summary": be.get("summary", ""),
+                                "aliases": be.get("aliases_to_add", []),
+                                "_source": "buffer",
+                            })
 
         system_prompt = """\
 你是知识图谱实体管理专家。用户消息产生了一批候选实体，你需要决定每个实体如何处理。
@@ -1082,6 +1168,30 @@ Return ONLY valid JSON:
                 logger.debug("Skipped entity '%s': %s", name, decision.get("reason", ""))
 
         return resolved
+
+    def _get_recent_buffer_entities(
+        self, tenant_id: str, user_id: str, limit: int = 10
+    ) -> List[Dict[str, Any]]:
+        """
+        Extract entity info from recent buffer entries (not yet consolidated).
+
+        This allows consecutive messages to reference entities that were encoded
+        in the current session but haven't been written to the graph yet.
+        """
+        try:
+            recent_units = self.buffer.read_recent(tenant_id, user_id, limit=limit)
+            entities = []
+            seen_names: set = set()
+            for unit in recent_units:
+                for ent in unit.get("entities", []):
+                    name = ent.get("name", "")
+                    if name and name not in seen_names:
+                        seen_names.add(name)
+                        entities.append(ent)
+            return entities
+        except Exception as e:
+            logger.warning("Failed to read recent buffer entities: %s", e)
+            return []
 
     async def _strict_dedup_check(self, entity_name: str, tenant_id: str, user_id: str) -> Optional[Node]:
         """
@@ -1309,7 +1419,7 @@ Return ONLY valid JSON:
                 "reason": prior.get("reason") or "no existing entities found",
             }
 
-        tag_taxonomy = ", ".join(t.name for t in self.tag_dict.get_all_active())
+        tag_taxonomy = self.tag_dict.get_hierarchy_tree_text()
         existing_list = "\n".join(
             f"- {e['name']} (id={e['id'][:8]}, tags={e['tags']}, "
             f"zone={e['zone']}, summary={e['summary'][:80]}, aliases={e.get('aliases', [])})"
@@ -1332,7 +1442,7 @@ Return ONLY valid JSON:
             f"  记忆区域：{raw_entity.get('zone', 'semantic')}\n"
             f"  摘要：{raw_entity.get('summary', '')}\n\n"
             f"图谱中的候选已有实体：\n{existing_list}\n\n"
-            f"可用标签分类法：[{tag_taxonomy}]"
+            f"可用标签层级树：\n{tag_taxonomy}"
             f"{prior_hint}"
         )
 

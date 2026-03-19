@@ -14,49 +14,48 @@ from server.engine.llm_client import call_llm_json
 logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = """\
-You are a memory value evaluator for an AI agent's long-term memory system. \
-Your task is to assess how worthy a message is of being stored in long-term memory.
+你是个人记忆系统的记忆价值评估器（对应前额叶皮层+杏仁核）。
+任务：判断一条消息是否值得写入长期记忆，并输出三个维度的评分。
 
-Evaluate the message on three dimensions (0-10 integer scores). \
-Use the FULL 0-10 range — do NOT cluster scores around 3-5.
+## 评分规则
 
-Scoring anchors:
+使用 0-10 整数评分，**务必用满全区间，不要扎堆在 3-5**。
 
-1. task_relevance (0-10):
-   0-2: Completely unrelated to any known goal (e.g., random chat, weather small talk)
-   3-4: Tangentially related (e.g., mentions a topic the user works with)
-   5-6: Moderately relevant (e.g., progress update on an active project)
-   7-8: Directly advances a key goal (e.g., "I got an interview at ByteDance")
-   9-10: Critical life decision or milestone (e.g., "I decided to resign", "I got the offer")
+### 1. task_relevance（任务关联度）
+0-2：与用户任何已知目标无关（闲聊、通用常识）
+3-4：涉及用户关注的话题，但未推进具体目标
+5-6：中等关联，如某个活跃项目的进展更新
+7-8：直接推进关键目标（如"拿到字节面试"、"项目上线了"）
+9-10：重大人生决策或里程碑（如"我决定离职"、"拿到 offer 了"）
 
-2. emotional_intensity (0-10):
-   0-2: Neutral, matter-of-fact
-   3-4: Mild emotion (slight frustration, mild happiness)
-   5-6: Moderate emotion (clearly happy, noticeably stressed)
-   7-8: Strong emotion (very excited, very angry, crying)
-   9-10: Extreme emotion (life-changing joy, deep grief, panic)
-   emotion_type must be one of: joy, sadness, anger, fear, surprise, neutral
+### 2. emotional_intensity（情绪强度）
+**评分时对照用户当前情绪基线**：若某种情绪与基线差异大（如基线低落时出现高兴），强度应上调；若与基线一致（如持续焦虑中又提到焦虑），强度应下调。
 
-3. novelty (0-10):
-   0-2: Already well-known information, repeated fact, OR information already stored in memory, \
-        OR temporary debugging/troubleshooting questions about transient technical issues
-   3-4: Minor new detail about a known topic
-   5-6: Meaningful new information
-   7-8: Surprising new fact or unexpected development
-   9-10: Completely unexpected, paradigm-shifting information
-   NOTE: If the user's context shows this information is already known \
-   (e.g., "user works at Meituan" is already in context), score novelty LOW (0-2). \
-   Debugging queries about temporary issues (e.g., "why are there two services") \
-   should also score LOW (0-2) as they are transient, not long-term memorable facts.
+0-2：平静中性，陈述事实
+3-4：轻微情绪（淡淡的沮丧、小确幸）
+5-6：明显情绪（明显开心、明显压力大）
+7-8：强烈情绪（非常兴奋、愤怒、哭泣）
+9-10：极端情绪（人生级别的喜悦、深度悲痛、恐慌）
 
-Encoding decision rules (apply in order):
-- If task_relevance >= 7 → encode_decision = true, encode_priority = "high"
-- If emotional_intensity >= 7 → encode_decision = true, encode_priority = "high"
-- If novelty >= 8 → encode_decision = true, encode_priority = "medium"
-- If task_relevance >= 5 OR novelty >= 5 → encode_decision = true, encode_priority = "low"
-- Otherwise → encode_decision = false, encode_priority = "low"
+emotion_type 必须是以下之一：joy / sadness / anger / fear / surprise / neutral
 
-Return ONLY valid JSON in this exact format:
+### 3. novelty（新颖度）
+0-2：已知信息、重复事实、上下文中已有记录，或针对临时技术问题的调试提问（转瞬即逝，不值得长期记忆）
+3-4：已知话题的细节补充
+5-6：有意义的新信息
+7-8：令人意外的新进展或事实
+9-10：完全超出预期、改变认知的信息
+
+> 若上下文中已有该信息（如画像中已有"在美团工作"），novelty 必须评 0-2。
+
+## 编码决策（按顺序匹配第一条）
+- task_relevance >= 7 → encode_decision=true, encode_priority="high"
+- emotional_intensity >= 7 → encode_decision=true, encode_priority="high"
+- novelty >= 8 → encode_decision=true, encode_priority="medium"
+- task_relevance >= 5 OR novelty >= 5 → encode_decision=true, encode_priority="low"
+- 其余 → encode_decision=false, encode_priority="low"
+
+## 返回格式（仅 JSON）
 {
   "task_relevance": <0-10>,
   "emotional_intensity": <0-10>,
@@ -64,7 +63,7 @@ Return ONLY valid JSON in this exact format:
   "novelty": <0-10>,
   "encode_decision": true|false,
   "encode_priority": "high|medium|low",
-  "reason": "one-sentence explanation"
+  "reason": "一句话解释"
 }
 """
 
@@ -125,26 +124,43 @@ class Evaluator:
     @staticmethod
     def _build_prompt(message: str, working_memory: Optional[Dict[str, Any]]) -> str:
         """Build the evaluation prompt with optional working memory context."""
-        parts = [f'Message to evaluate:\n"""\n{message}\n"""']
+        parts = [f'待评估消息：\n"""\n{message}\n"""']
 
         if working_memory:
             context_parts = []
+
+            raw = working_memory.get("raw", {})
+
+            # User profile
+            profile = raw.get("user_profile", {})
+            if profile:
+                context_parts.append(f"用户画像：{profile}")
+
+            # Active goals
             if working_memory.get("user_goals"):
                 goals = "\n".join(f"- {g}" for g in working_memory["user_goals"])
-                context_parts.append(f"User's active goals:\n{goals}")
-            raw = working_memory.get("raw", {})
+                context_parts.append(f"当前活跃目标：\n{goals}")
+
+            # Recent events
             if raw.get("recent_events"):
                 events_text = "; ".join(
                     str(e.get("summary", e.get("name", "")))
                     for e in raw["recent_events"][:5]
                 )
-                context_parts.append(f"Recent key events: {events_text}")
-            # Inject user profile for better context
-            profile = raw.get("user_profile", {})
-            if profile:
-                context_parts.append(f"User profile: {profile}")
+                context_parts.append(f"近期关键事件：{events_text}")
+
+            # Emotional baseline — critical for calibrating emotional_intensity
+            baseline = working_memory.get("emotional_baseline", "neutral")
+            context_parts.append(f"用户当前情绪基线：{baseline}（评分 emotional_intensity 时以此为参照）")
+
+            # Recent session messages for novelty calibration
+            session_msgs = working_memory.get("session_messages", [])
+            if session_msgs:
+                lines = "\n".join(f"- {m}" for m in session_msgs[-5:])
+                context_parts.append(f"本 session 已编码的消息（用于判断新颖度）：\n{lines}")
+
             if context_parts:
-                parts.append("Context for task_relevance scoring:\n" + "\n".join(context_parts))
+                parts.append("用户上下文：\n" + "\n".join(context_parts))
 
         return "\n\n".join(parts)
 

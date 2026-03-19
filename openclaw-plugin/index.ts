@@ -11,7 +11,7 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
 
 // ============================================================================
 // Config
@@ -51,8 +51,7 @@ async function postJSON(url: string, body: unknown, timeoutMs = 15000): Promise<
       body: JSON.stringify(body),
       signal: controller.signal,
     });
-    const json = await res.json();
-    return json;
+    return await res.json();
   } finally {
     clearTimeout(timer);
   }
@@ -91,9 +90,9 @@ function startServer(serverPath: string, logger: any): ChildProcess {
     stdio: ["ignore", "pipe", "pipe"],
     detached: false,
   });
-  proc.stdout?.on("data", (d: Buffer) => logger.info(`brain-memory-server: ${d.toString().trim()}`));
-  proc.stderr?.on("data", (d: Buffer) => logger.warn(`brain-memory-server: ${d.toString().trim()}`));
-  proc.on("exit", (code) => {
+  proc.stdout?.on("data", (d: Uint8Array) => logger.info(`brain-memory-server: ${d.toString().trim()}`));
+  proc.stderr?.on("data", (d: Uint8Array) => logger.warn(`brain-memory-server: ${d.toString().trim()}`));
+  proc.on("exit", (code: number | null) => {
     logger.warn(`brain-memory: server exited with code ${code}`);
     serverProcess = null;
   });
@@ -125,6 +124,9 @@ async function ensureServer(cfg: BrainMemoryConfig, logger: any): Promise<boolea
 // Map OpenClaw sessionKey → brain-memory sessionId
 const sessionMap = new Map<string, string>();
 
+// Temporary store: sessionKey → last inbound user message (set at message:preprocessed, consumed at message:sent)
+const pendingUserMessages = new Map<string, string>();
+
 function getOrCreateSessionId(sessionKey: string): string {
   let sid = sessionMap.get(sessionKey);
   if (!sid) {
@@ -141,8 +143,16 @@ function getOrCreateSessionId(sessionKey: string): string {
 const brainMemoryPlugin = {
   id: "brain-memory",
   name: "Brain Memory",
-  description: "Hippocampal-inspired memory with working memory, encoder buffer, and sleep consolidation",
-  kind: "context-engine" as const,
+  configSchema: {
+    type: "object",
+    properties: {
+      serverUrl: { type: "string", default: "http://localhost:8100" },
+      tenantId: { type: "string", default: "default" },
+      userId: { type: "string", default: "yugo" },
+      autoStart: { type: "boolean", default: true },
+      serverPath: { type: "string", default: "/root/.openclaw/workspace/projects/brain-memory" },
+    },
+  },
 
   register(api: OpenClawPluginApi) {
     const cfg = parseConfig(api.pluginConfig as Record<string, unknown>);
@@ -168,7 +178,7 @@ const brainMemoryPlugin = {
           },
           required: ["query"],
         } as any,
-        async execute(_toolCallId: string, params: unknown) {
+        async execute(_id: string, params: unknown) {
           const { query, max_results = 10 } = params as { query: string; max_results?: number };
           const sessionKey = "tool-recall";
           const sessionId = getOrCreateSessionId(sessionKey);
@@ -179,23 +189,22 @@ const brainMemoryPlugin = {
               user_id: cfg.userId,
               session_id: sessionId,
               query,
+              max_results,
               recent_messages: [],
             });
 
             const context = result?.data?.context || "No relevant memories found.";
             return {
               content: [{ type: "text", text: context }],
-              details: { memories_count: result?.data?.memories?.length || 0 },
             };
           } catch (err) {
             return {
               content: [{ type: "text", text: `Memory recall failed: ${String(err)}` }],
-              details: { error: String(err) },
             };
           }
         },
       },
-      { name: "brain_recall" },
+      { optional: true },
     );
 
     api.registerTool(
@@ -206,7 +215,7 @@ const brainMemoryPlugin = {
           "Performs deduplication, pattern discovery, and memory decay. " +
           "Use periodically or when explicitly asked to consolidate memories.",
         parameters: { type: "object", properties: {}, required: [] } as any,
-        async execute() {
+        async execute(_id: string, _params: unknown) {
           try {
             const result = await postJSON(`${cfg.serverUrl}/hooks/consolidate`, {
               tenant_id: cfg.tenantId,
@@ -219,7 +228,6 @@ const brainMemoryPlugin = {
                 text: `Consolidation triggered. Nodes created: ${stats.nodes_created || 0}, ` +
                   `updated: ${stats.nodes_updated || 0}, relations: ${stats.relations_created || 0}`,
               }],
-              details: stats,
             };
           } catch (err) {
             return {
@@ -228,7 +236,7 @@ const brainMemoryPlugin = {
           }
         },
       },
-      { name: "brain_consolidate" },
+      { optional: true },
     );
 
     // ========================================================================
@@ -240,25 +248,22 @@ const brainMemoryPlugin = {
       if (sessionKey.includes(":cron:")) return false;
       // Skip sub-agents
       if (sessionKey.includes(":subagent:")) return false;
-      // Skip heartbeat prompts
-      if (prompt && (
-        prompt.includes("HEARTBEAT") ||
-        prompt.includes("Read HEARTBEAT.md") ||
-        prompt.includes("Pre-compaction memory flush")
-      )) return false;
-      // Skip cron task content in prompt
-      if (prompt && prompt.includes("[cron:")) return false;
-      // Skip inter-session messages
-      if (prompt && prompt.includes("[Inter-session message]")) return false;
-      return true;
+      // Skip heartbeat prompts, cron tasks, and inter-session messages
+      return !(
+        prompt?.includes("HEARTBEAT") ||
+        prompt?.includes("Read HEARTBEAT.md") ||
+        prompt?.includes("Pre-compaction memory flush") ||
+        prompt?.includes("[cron:") ||
+        prompt?.includes("[Inter-session message]")
+      );
     }
 
     // ========================================================================
     // Lifecycle Hooks
     // ========================================================================
 
-    // --- before_agent_start: inject working memory context ---
-    api.on("before_agent_start", async (event, ctx) => {
+    // --- before_prompt_build: inject working memory context (runs after session load, messages available) ---
+    api.on("before_prompt_build", async (event: any, ctx: any) => {
       if (!event.prompt || event.prompt.length < 5) return;
 
       const sessionKey = ctx.sessionKey || "default";
@@ -286,20 +291,20 @@ const brainMemoryPlugin = {
       if (query.length < 5) return;
 
       try {
-        // Run session-start and before-query in parallel to save time
-        const [wmResult, retrieveResult] = await Promise.all([
-          postJSON(`${cfg.serverUrl}/hooks/session-start`, {
-            tenant_id: cfg.tenantId,
-            user_id: cfg.userId,
-            session_id: sessionId,
-          }, 8000).catch(() => null),
-          postJSON(`${cfg.serverUrl}/hooks/before-query`, {
-            tenant_id: cfg.tenantId,
-            user_id: cfg.userId,
-            session_id: sessionId,
-            query: query,
-          }, 8000).catch(() => null),
-        ]);
+        // Sequential: session-start must complete before before-query
+        // so that WM is loaded before retrieval tries to use it
+        const wmResult = await postJSON(`${cfg.serverUrl}/hooks/session-start`, {
+          tenant_id: cfg.tenantId,
+          user_id: cfg.userId,
+          session_id: sessionId,
+        }, 8000).catch(() => null);
+
+        const retrieveResult = await postJSON(`${cfg.serverUrl}/hooks/before-query`, {
+          tenant_id: cfg.tenantId,
+          user_id: cfg.userId,
+          session_id: sessionId,
+          query: query,
+        }, 8000).catch(() => null);
 
         const wmContext = wmResult?.data?.context;
         const retrievedContext = retrieveResult?.data?.context;
@@ -322,124 +327,115 @@ const brainMemoryPlugin = {
       }
     });
 
-    // --- agent_end: encode informative messages into buffer ---
-    api.on("agent_end", async (event, ctx) => {
-      if (!event.success || !event.messages || event.messages.length === 0) return;
+    // --- message:sent: encode the inbound user message after AI response is delivered ---
+    // event.sessionKey — session identifier
+    // event.context.content — the assistant response text just sent
+    // event.context.channelId — channel type (whatsapp, telegram, etc.)
+    api.registerHook(
+      "message:sent",
+      async (event: any) => {
+        if (!event.context?.success) return;
 
-      const sessionKey = ctx.sessionKey || "default";
+        const sessionKey = event.sessionKey || "default";
+        if (!isUserSession(sessionKey)) return;
 
-      // Only process real user conversations
-      if (!isUserSession(sessionKey)) return;
+        // Retrieve the inbound user message stored at message:preprocessed time
+        const userMessage = pendingUserMessages.get(sessionKey);
+        if (!userMessage) return;
+        pendingUserMessages.delete(sessionKey);
 
-      const sessionId = getOrCreateSessionId(sessionKey);
-
-      try {
-        // Only process the LAST user message (not all historical messages)
-        // event.messages contains the full conversation history
-        let lastUserText = "";
-        for (let i = event.messages.length - 1; i >= 0; i--) {
-          const msg = event.messages[i];
-          if (!msg || typeof msg !== "object") continue;
-          const msgObj = msg as Record<string, unknown>;
-          if (msgObj.role !== "user") continue;
-
-          let text = "";
-          if (typeof msgObj.content === "string") {
-            text = msgObj.content;
-          } else if (Array.isArray(msgObj.content)) {
-            for (const block of msgObj.content) {
-              if (block && typeof block === "object" && (block as any).type === "text") {
-                text += (block as any).text + " ";
-              }
-            }
-          }
-          text = text.trim();
-          if (text.length >= 10) {
-            lastUserText = text;
-            break;
-          }
-        }
-
-        if (!lastUserText || lastUserText.length < 10 || lastUserText.length > 2000) return;
-
-        let text = lastUserText;
-
-        // Skip pure system-generated / internal content
-        if (text.includes("<working-memory>") || text.includes("<retrieved-memories>")) return;
-        if (text.includes("<<<BEGIN_UNTRUSTED_CHILD_RESULT>>>")) return;
-        if (text.includes("[Internal task completion event]")) return;
-        if (text.includes("OpenClaw runtime context (internal)")) return;
-        if (text.includes("subagent_announce")) return;
-        if (text.includes("HEARTBEAT_OK") || text.includes("Read HEARTBEAT.md")) return;
-        if (/^\[Inter-session message\]/.test(text)) return;
-        if (/^System:/.test(text)) return;
-        if (/\[cron:/.test(text)) return;
-        if (text.includes("Pre-compaction memory flush")) return;
-
-        // Extract actual user text from messages with metadata prefix
-        if (text.includes("message_id") && text.includes("sender_id")) {
-          const parts = text.split(/\n\n/);
-          let extracted = "";
-          for (let j = parts.length - 1; j >= 0; j--) {
-            const part = parts[j].trim();
-            if (!part) continue;
-            if (part.startsWith("{") || part.startsWith("```")) continue;
-            if (part.startsWith("Conversation info") || part.startsWith("Sender (")) continue;
-            extracted = part;
-            break;
-          }
-          if (extracted && extracted.length >= 5) {
-            text = extracted;
-          } else {
-            return;
-          }
-        }
+        const sessionId = getOrCreateSessionId(sessionKey);
+        const assistantResponse: string = event.context?.content || "";
 
         // Fire-and-forget: send to perceiver → evaluator → encoder pipeline
         postJSON(`${cfg.serverUrl}/hooks/after-response`, {
           tenant_id: cfg.tenantId,
           user_id: cfg.userId,
           session_id: sessionId,
-          user_message: text,
-          assistant_response: "",
+          user_message: userMessage,
+          assistant_response: assistantResponse,
         }).catch((err) => {
           api.logger.warn(`brain-memory: after-response failed: ${String(err)}`);
         });
-      } catch (err) {
-        api.logger.warn(`brain-memory: agent_end hook failed: ${String(err)}`);
-      }
-    });
+      },
+      {
+        name: "brain-memory.message-sent",
+        description: "Encodes the user message + assistant response into the brain-memory buffer after delivery",
+      },
+    );
 
-    // --- session_end: generate session summary ---
-    api.on("session_end", async (event, ctx) => {
-      const sessionKey = ctx.sessionKey || "default";
+    // --- message:preprocessed: capture the cleaned inbound user message before it reaches the agent ---
+    // event.context.bodyForAgent — final enhanced text visible to the agent
+    api.registerHook(
+      "message:preprocessed",
+      async (event: any) => {
+        const sessionKey = event.sessionKey || "default";
+        if (!isUserSession(sessionKey)) return;
 
-      // Only process real user conversations
-      if (!isUserSession(sessionKey)) return;
+        const text: string = (event.context?.bodyForAgent || event.context?.body || "").trim();
+        if (text.length < 10 || text.length > 2000) return;
 
-      const sessionId = sessionMap.get(sessionKey);
-      if (!sessionId) return;
+        // Skip system-generated content
+        if (
+          text.includes("<working-memory>") || text.includes("<retrieved-memories>") ||
+          text.includes("<<<BEGIN_UNTRUSTED_CHILD_RESULT>>>") ||
+          text.includes("[Internal task completion event]") ||
+          text.includes("OpenClaw runtime context (internal)") ||
+          text.includes("subagent_announce") ||
+          text.includes("HEARTBEAT_OK") || text.includes("Read HEARTBEAT.md") ||
+          text.includes("Pre-compaction memory flush") ||
+          /^\[Inter-session message]/.test(text) ||
+          /^System:/.test(text) ||
+          /\[cron:/.test(text)
+        ) return;
 
-      try {
-        await postJSON(`${cfg.serverUrl}/hooks/session-end`, {
-          tenant_id: cfg.tenantId,
-          user_id: cfg.userId,
-          session_id: sessionId,
-          conversation_history: [],
-        });
-        sessionMap.delete(sessionKey);
-        api.logger.info?.(`brain-memory: session ${sessionKey} ended, summary generated`);
-      } catch (err) {
-        api.logger.warn(`brain-memory: session_end failed: ${String(err)}`);
-      }
-    });
+        // Stash for message:sent handler to pick up
+        pendingUserMessages.set(sessionKey, text);
+      },
+      {
+        name: "brain-memory.message-preprocessed",
+        description: "Captures the inbound user message for later encoding",
+      },
+    );
+
+    // --- command:new: generate session summary when user starts a new session (/new) ---
+    // event.sessionKey — the OLD session key being closed
+    // event.context.senderId — user identifier
+    api.registerHook(
+      "command:new",
+      async (event: any) => {
+        const sessionKey = event.sessionKey || "default";
+
+        // Only process real user conversations
+        if (!isUserSession(sessionKey)) return;
+
+        const sessionId = sessionMap.get(sessionKey);
+        if (!sessionId) return;
+
+        try {
+          await postJSON(`${cfg.serverUrl}/hooks/session-end`, {
+            tenant_id: cfg.tenantId,
+            user_id: cfg.userId,
+            session_id: sessionId,
+          });
+          sessionMap.delete(sessionKey);
+          api.logger.info?.(`brain-memory: session ${sessionKey} ended, summary generated`);
+        } catch (err) {
+          api.logger.warn(`brain-memory: session_end failed: ${String(err)}`);
+        }
+      },
+      {
+        name: "brain-memory.command-new",
+        description: "Generates a session summary and clears working memory when user issues /new",
+      },
+    );
 
     // ========================================================================
     // CLI Commands
     // ========================================================================
 
     api.registerCli(
-      ({ program }) => {
+      ({ program }: { program: any }) => {
         const brain = program.command("brain").description("Brain memory plugin commands");
 
         brain

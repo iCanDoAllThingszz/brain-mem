@@ -16,9 +16,11 @@ from server.engine.evaluator import Evaluator
 from server.engine.encoder import Encoder
 from server.engine.retriever import Retriever
 from server.engine.consolidator import Consolidator
-from server.engine.working_memory import WorkingMemory
+from server.engine.working_memory import WorkingMemory, _goal_label
 from server.engine.prospective_checker import ProspectiveChecker
+from server.engine.profile_updater import ProfileUpdater
 from server.engine.llm_client import configure as configure_llm
+from server.storage.user_profile import UserProfileStore
 from server.activity_log import log_event, read_recent
 
 # ---------------------------------------------------------------------------
@@ -74,6 +76,7 @@ async def lifespan(app: FastAPI):
     os.makedirs("./data", exist_ok=True)
     tag_dict = TagDict(path=storage_config.get("tag_dict", {}).get("path", "./data/tag_dict.json"))
     buffer = EncoderBuffer(db_path=storage_config.get("buffer", {}).get("path", "./data/buffer.db"))
+    profile_store = UserProfileStore(db_path=storage_config.get("user_profiles", {}).get("path", "./data/user_profiles.db"))
 
     for tag in SEED_TAGS:
         if not tag_dict.get_tag(tag):
@@ -87,8 +90,9 @@ async def lifespan(app: FastAPI):
     app.state.encoder = Encoder(graph, tag_dict, buffer)
     app.state.retriever = Retriever(graph, buffer)
     app.state.consolidator = Consolidator(graph, tag_dict, buffer)
-    app.state.working_memory = WorkingMemory(graph, buffer)
+    app.state.working_memory = WorkingMemory(graph, buffer, profile_store)
     app.state.prospective_checker = ProspectiveChecker(graph)
+    app.state.profile_updater = ProfileUpdater(profile_store)
 
     # Ensure vector index exists
     try:
@@ -111,7 +115,7 @@ app = FastAPI(title="Brain Memory Service", version="0.1.0", lifespan=lifespan)
 
 # Session message counters for intermediate summaries
 _session_msg_counts: Dict[str, int] = {}
-_SESSION_SUMMARY_INTERVAL = 10  # Generate summary every N messages
+_SESSION_SUMMARY_INTERVAL = 5  # Generate summary every N encoded QA rounds
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +143,7 @@ class AfterResponseRequest(BaseRequest):
 
 
 class SessionEndRequest(BaseRequest):
-    conversation_history: list
+    conversation_history: list = []
 
 
 class ConsolidateRequest(BaseModel):
@@ -263,33 +267,44 @@ async def before_query(req: BeforeQueryRequest, request: Request):
 
 # --- background task helpers ---
 
+_POSITIVE_EMOTIONS = {"joy", "surprise"}
+_NEGATIVE_EMOTIONS = {"sadness", "anger", "fear"}
+
+
+def _update_emotional_baseline(
+    wm_store: WorkingMemory, session_id: str, evaluation: dict
+) -> None:
+    """Update the in-memory WM emotional baseline from the current message's emotion.
+
+    Only updates when emotional_intensity >= 3 to avoid noise from low-signal messages.
+    Intensity < 3 leaves the baseline unchanged (emotions persist until a new signal arrives).
+    """
+    emotion_type = evaluation.get("emotion_type", "neutral")
+    intensity = float(evaluation.get("emotional_intensity", 0))
+    if intensity < 3 or emotion_type == "neutral":
+        return
+    if emotion_type in _POSITIVE_EMOTIONS:
+        new_baseline = "positive"
+    elif emotion_type in _NEGATIVE_EMOTIONS:
+        new_baseline = "negative"
+    else:
+        return
+    wm_store.update(session_id, {"emotional_baseline": new_baseline})
+
+
 async def _process_after_response(
     user_message: str,
+    assistant_response: str,
     tenant_id: str, user_id: str, session_id: str,
     perceiver: Perceiver, evaluator: Evaluator, encoder: Encoder,
     wm_store: WorkingMemory,
+    profile_updater: ProfileUpdater,
 ):
     try:
-        # Increment session message counter for intermediate summaries
-        global _session_msg_counts
-        _session_msg_counts[session_id] = _session_msg_counts.get(session_id, 0) + 1
-        msg_count = _session_msg_counts[session_id]
-
-        # Trigger intermediate summary every N messages
-        if msg_count % _SESSION_SUMMARY_INTERVAL == 0:
-            logger.info("Triggering intermediate summary for session %s (msg_count=%d)", session_id, msg_count)
-            try:
-                # Generate summary with empty conversation history (will use buffer contents)
-                await encoder.generate_session_summary([], tenant_id, user_id, session_id)
-                log_event("intermediate_summary", f"Generated intermediate summary for session {session_id[:8]}", {
-                    "session_id": session_id,
-                    "message_count": msg_count,
-                })
-            except Exception as e:
-                logger.warning("Intermediate summary generation failed: %s", e)
-
         wm = wm_store.get(session_id)
-        perception = await perceiver.classify(user_message, wm)
+
+        # 1.丘脑分类
+        perception = await perceiver.classify(user_message, wm, assistant_response=assistant_response)
         msg_type = perception.get("type")
         rewrite = perception.get("rewrite")
         logger.info("after-response perceiver type=%s rewrite=%s session=%s",
@@ -298,7 +313,7 @@ async def _process_after_response(
         log_event("perceiver", f"[{msg_type}] {user_message[:60]}", {
             "type": msg_type,
             "category": perception.get("category", "cognition"),
-            "target_entity": perception.get("target_entity"),
+            "target_entities": perception.get("target_entities"),
             "reason": perception.get("reason", ""),
             "rewrite": rewrite[:100] if rewrite else None,
         })
@@ -308,11 +323,9 @@ async def _process_after_response(
             memory_input = rewrite or user_message
             category = perception.get("category", "cognition")
 
-            # Log-type, reconsolidation, prospective, and forget messages bypass evaluator
-            # Logs are always worth recording, reconsolidations are user-initiated corrections
-            # Prospective memories are always important (reminders)
-            # Forget commands are always executed immediately
-            if category.startswith("log_") or category == "reconsolidation" or category == "prospective" or category == "forget":
+            # log / reconsolidation / prospective / forget bypass the evaluator:
+            # logs are always worth recording as-is, the others have explicit user intent
+            if category in ("log", "reconsolidation", "prospective", "forget"):
                 evaluation = {
                     "task_relevance": 5,
                     "emotional_intensity": 0,
@@ -322,7 +335,7 @@ async def _process_after_response(
                     "encode_priority": "high" if category in ("prospective", "forget") else "low",
                     "reason": f"{category} message, auto-encode",
                     "category": category,
-                    "target_entity": perception.get("target_entity"),
+                    "target_entities": perception.get("target_entities"),
                     "correction_type": perception.get("correction_type"),
                     "trigger_type": perception.get("trigger_type"),
                     "trigger_value": perception.get("trigger_value"),
@@ -333,6 +346,7 @@ async def _process_after_response(
                     "reason": f"{category} auto-encode",
                 })
             else:
+                # 2.前额叶皮层+杏仁核打分
                 evaluation = await evaluator.evaluate(memory_input, wm)
                 log_event("evaluator", f"relevance={evaluation.get('task_relevance')} emotion={evaluation.get('emotional_intensity')} novelty={evaluation.get('novelty')}", {
                     "encode_decision": evaluation.get("encode_decision"),
@@ -340,10 +354,16 @@ async def _process_after_response(
                     "reason": evaluation.get("reason", ""),
                 })
 
+            # Update emotional baseline in WM based on this message's emotion.
+            # Runs for all informative messages (not just encoded ones) so the
+            # perceiver always sees the user's current emotional state.
+            if wm is not None:
+                _update_emotional_baseline(wm_store, session_id, evaluation)
+
             if evaluation.get("encode_decision"):
-                # Pass category, target_entity, correction_type, and prospective fields to encoder
+                # Pass category, target_entities, correction_type, and prospective fields to encoder
                 evaluation["category"] = perception.get("category", "cognition")
-                evaluation["target_entity"] = perception.get("target_entity")
+                evaluation["target_entities"] = perception.get("target_entities")
                 evaluation["correction_type"] = perception.get("correction_type")
                 evaluation["trigger_type"] = perception.get("trigger_type")
                 evaluation["trigger_value"] = perception.get("trigger_value")
@@ -368,20 +388,54 @@ async def _process_after_response(
                         "entities": entity_details,
                         "relations": len(result.get("relations", [])),
                     })
+
+                    # Append encoded message to working memory so later messages in this
+                    # session can reference what was already discussed and encoded
+                    if wm is not None:
+                        session_msgs = list(wm.get("session_messages", []))
+                        session_msgs.append(memory_input)
+                        wm_store.update(session_id, {"session_messages": session_msgs[-10:]})
+
+                    # Incrementally update persistent user profile and goals,
+                    # then refresh the in-memory WM cache so this session sees
+                    # the latest user_profile and user_goals immediately
+                    updated = await profile_updater.update(tenant_id, user_id, memory_input)
+                    if updated and wm is not None:
+                        wm_store.update(session_id, {
+                            "user_goals": [_goal_label(g) for g in updated["goals"]],
+                            "raw": {
+                                "user_profile": updated["profile"],
+                                "active_goals": updated["goals"],
+                            },
+                        })
+
+                    # Count encoded QA rounds and trigger intermediate summary every N rounds
+                    global _session_msg_counts
+                    _session_msg_counts[session_id] = _session_msg_counts.get(session_id, 0) + 1
+                    encoded_count = _session_msg_counts[session_id]
+                    if encoded_count % _SESSION_SUMMARY_INTERVAL == 0:
+                        logger.info("Triggering intermediate summary for session %s (encoded_count=%d)", session_id, encoded_count)
+                        try:
+                            await encoder.generate_session_summary(tenant_id, user_id, session_id)
+                            log_event("intermediate_summary", f"Generated intermediate summary for session {session_id[:8]}", {
+                                "session_id": session_id,
+                                "encoded_count": encoded_count,
+                            })
+                        except Exception as e:
+                            logger.warning("Intermediate summary generation failed: %s", e)
                 logger.info("after-response encoded | session=%s", session_id)
     except Exception as exc:
         logger.exception("after-response background task failed: %s", exc)
 
 
 async def _process_session_end(
-    conversation_history: list,
     tenant_id: str, user_id: str, session_id: str,
     encoder: Encoder, wm_store: WorkingMemory,
 ):
     try:
-        await encoder.generate_session_summary(
-            conversation_history, tenant_id, user_id, session_id
-        )
+        # Summary is now generated from buffer's encoded memory units,
+        # no need for conversation_history parameter.
+        await encoder.generate_session_summary(tenant_id, user_id, session_id)
         wm_store.destroy(session_id)
 
         # Clean up session message counter
@@ -418,11 +472,13 @@ async def after_response(req: AfterResponseRequest, request: Request, background
     logger.info("after-response | session=%s", req.session_id)
     background_tasks.add_task(
         _process_after_response,
-        req.user_message, req.tenant_id, req.user_id, req.session_id,
+        req.user_message, req.assistant_response,
+        req.tenant_id, req.user_id, req.session_id,
         request.app.state.perceiver,
         request.app.state.evaluator,
         request.app.state.encoder,
         request.app.state.working_memory,
+        request.app.state.profile_updater,
     )
     return ok({"status": "accepted"})
 
@@ -432,7 +488,7 @@ async def session_end(req: SessionEndRequest, request: Request, background_tasks
     logger.info("session-end | session=%s", req.session_id)
     background_tasks.add_task(
         _process_session_end,
-        req.conversation_history, req.tenant_id, req.user_id, req.session_id,
+        req.tenant_id, req.user_id, req.session_id,
         request.app.state.encoder,
         request.app.state.working_memory,
     )

@@ -192,26 +192,38 @@ class GraphStore:
             result = await session.run(query, alias=alias, tenant_id=tenant_id, user_id=user_id)
             return [Node.from_neo4j_props(dict(r["n"])) async for r in result]
 
-    async def find_nodes_by_tags(self, tags: List[str], tenant_id: str, user_id: str) -> List[Node]:
+    async def find_nodes_by_tags(
+        self, tags: List[str], tenant_id: str, user_id: str,
+        expand_hierarchy: bool = False, tag_dict=None,
+    ) -> List[Node]:
         """
-        Find nodes that contain ALL of the specified tags.
+        Find nodes that contain ANY of the specified tags.
+
+        When expand_hierarchy=True and tag_dict is provided, each tag is expanded
+        to include all descendant tags in the hierarchy before querying.
 
         Args:
-            tags: List of tags that must all be present
+            tags: List of tags (ANY match)
             tenant_id: Tenant scope
             user_id: User scope
+            expand_hierarchy: Whether to expand tags to include children
+            tag_dict: TagDict instance for hierarchy expansion
 
         Returns:
             List of matching nodes
         """
+        search_tags = tags
+        if expand_hierarchy and tag_dict is not None:
+            search_tags = tag_dict.expand_tags_with_children(tags)
+
         driver = self._ensure_connected()
         query = """
         MATCH (n:MemoryNode {tenant_id: $tenant_id, user_id: $user_id})
-        WHERE ALL(tag IN $tags WHERE tag IN n.tags)
+        WHERE ANY(tag IN $tags WHERE tag IN n.tags)
         RETURN n
         """
         async with driver.session() as session:
-            result = await session.run(query, tags=tags, tenant_id=tenant_id, user_id=user_id)
+            result = await session.run(query, tags=search_tags, tenant_id=tenant_id, user_id=user_id)
             return [Node.from_neo4j_props(dict(r["n"])) async for r in result]
 
     async def find_nodes_fuzzy(self, keyword: str, tenant_id: str, user_id: str) -> List[Node]:

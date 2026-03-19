@@ -202,6 +202,7 @@ class EncoderBuffer:
     ) -> List[Dict[str, Any]]:
         """
         Read the most recent N memory units for a tenant/user.
+        Excludes session_summary units — use get_latest_session_summary() for those.
 
         Args:
             tenant_id: Tenant scope
@@ -215,7 +216,7 @@ class EncoderBuffer:
             rows = conn.execute(
                 """
                 SELECT * FROM memory_buffer
-                WHERE tenant_id = ? AND user_id = ?
+                WHERE tenant_id = ? AND user_id = ? AND type != 'session_summary'
                 ORDER BY timestamp DESC
                 LIMIT ?
                 """,
@@ -279,6 +280,7 @@ class EncoderBuffer:
     def read_unarchived(self, tenant_id: str, user_id: str) -> List[Dict[str, Any]]:
         """
         Read all unarchived memory units for a tenant/user, oldest first.
+        Excludes session_summary units — those are metadata, not consolidation targets.
 
         Args:
             tenant_id: Tenant scope
@@ -292,6 +294,7 @@ class EncoderBuffer:
                 """
                 SELECT * FROM memory_buffer
                 WHERE tenant_id = ? AND user_id = ? AND archived = 0
+                  AND type != 'session_summary'
                 ORDER BY timestamp ASC
                 """,
                 (tenant_id, user_id),

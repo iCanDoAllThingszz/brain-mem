@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 from server.engine.llm_client import call_llm
 from server.storage.buffer import EncoderBuffer
 from server.storage.graph import GraphStore
+from server.storage.user_profile import UserProfileStore
 
 logger = logging.getLogger(__name__)
 
@@ -50,16 +51,15 @@ class WorkingMemory:
     # Class-level in-memory cache: session_id → context dict
     _cache: Dict[str, Dict[str, Any]] = {}
 
-    def __init__(self, graph: GraphStore, buffer: EncoderBuffer) -> None:
-        """
-        Initialize working memory.
-
-        Args:
-            graph: GraphStore instance for long-term memory queries.
-            buffer: EncoderBuffer instance for recent session summaries.
-        """
+    def __init__(
+        self,
+        graph: GraphStore,
+        buffer: EncoderBuffer,
+        profile_store: Optional[UserProfileStore] = None,
+    ) -> None:
         self.graph = graph
         self.buffer = buffer
+        self.profile_store = profile_store
 
     async def load(
         self,
@@ -99,11 +99,29 @@ class WorkingMemory:
         """
         raw: Dict[str, Any] = {}
 
-        # 1. User profile
-        raw["user_profile"] = user_profile or {}
+        # 1. User profile — prefer persistent store (incrementally enriched by LLM),
+        #    fall back to the value passed in from the caller
+        if self.profile_store:
+            stored = self.profile_store.get(tenant_id, user_id)
+            raw["user_profile"] = stored["profile"] or user_profile or {}
+            stored_goals = stored["goals"]  # May be used below
+        else:
+            raw["user_profile"] = user_profile or {}
+            stored_goals = []
 
-        # 2. Active goals
-        active_goals = await self._fetch_active_goals(tenant_id, user_id)
+        # 2. Active goals — use stored goals (LLM-enriched, contain status+progress)
+        #    when available; fall back to graph query otherwise
+        # Fetch all active nodes once and reuse for goals, reminders, and reviews (P8)
+        all_active_nodes = []
+        try:
+            all_active_nodes = await self.graph.find_active_nodes(tenant_id, user_id)
+        except Exception as e:
+            logger.warning("find_active_nodes failed: %s", e)
+
+        if stored_goals:
+            active_goals = stored_goals
+        else:
+            active_goals = self._filter_goals(all_active_nodes)
         raw["active_goals"] = active_goals
 
         # 3. Recent key events (last 7 days episodic nodes)
@@ -122,12 +140,12 @@ class WorkingMemory:
             logger.warning("get_latest_session_summary failed: %s", e)
         raw["last_session_summary"] = last_summary
 
-        # 6. Pending reminders
-        pending_reminders = await self._fetch_pending_reminders(tenant_id, user_id)
+        # 6. Pending reminders (reuse all_active_nodes)
+        pending_reminders = self._filter_pending_reminders(all_active_nodes)
         raw["pending_reminders"] = pending_reminders
 
-        # 7. Pending reviews (spaced repetition)
-        pending_reviews = await self._fetch_pending_reviews(tenant_id, user_id)
+        # 7. Pending reviews (reuse all_active_nodes)
+        pending_reviews = self._filter_pending_reviews(all_active_nodes)
         raw["pending_reviews"] = pending_reviews
 
         if agent_context:
@@ -140,7 +158,8 @@ class WorkingMemory:
             "context": context_text,
             "pending_reminders": [r.get("name", str(r)) for r in pending_reminders],
             "pending_reviews": [r.get("name", str(r)) for r in pending_reviews],
-            "user_goals": [g.get("name", str(g)) for g in active_goals],
+            # For stored goals include progress so perceiver gets richer context
+            "user_goals": [_goal_label(g) for g in active_goals],
             "emotional_baseline": emotional_baseline,
             "raw": raw,
             "session_id": session_id,
@@ -179,10 +198,12 @@ class WorkingMemory:
         if session_id not in self._cache:
             logger.warning("update called for unknown session %s", session_id)
             return
+        # Deep merge "raw" to avoid overwriting sibling keys (e.g. recent_events)
+        # when updates only contains a subset like {"raw": {"user_profile": ...}}
+        raw_updates = updates.pop("raw", None)
         self._cache[session_id].update(updates)
-        # Also merge into raw if provided
-        if "raw" in updates and isinstance(updates["raw"], dict):
-            self._cache[session_id].setdefault("raw", {}).update(updates["raw"])
+        if isinstance(raw_updates, dict):
+            self._cache[session_id].setdefault("raw", {}).update(raw_updates)
 
     def destroy(self, session_id: str) -> None:
         """
@@ -203,21 +224,27 @@ class WorkingMemory:
         self, tenant_id: str, user_id: str
     ) -> List[Dict[str, Any]]:
         """Fetch nodes tagged '计划' or '目标' with status=active."""
-        goals = []
-        target_tags = {"计划", "目标"}
         try:
             nodes = await self.graph.find_active_nodes(tenant_id, user_id)
-            for node in nodes:
-                node_tags = set(node.tags or [])
-                if node_tags & target_tags and node.status == "active":
-                    goals.append({
-                        "id": node.id,
-                        "name": node.name,
-                        "summary": node.summary,
-                        "tags": node.tags,
-                    })
+            return self._filter_goals(nodes)
         except Exception as e:
             logger.warning("fetch_active_goals failed: %s", e)
+            return []
+
+    @staticmethod
+    def _filter_goals(nodes: List) -> List[Dict[str, Any]]:
+        """Filter goal nodes from a pre-fetched list of active nodes."""
+        goals = []
+        target_tags = {"计划", "目标"}
+        for node in nodes:
+            node_tags = set(node.tags or [])
+            if node_tags & target_tags and node.status == "active":
+                goals.append({
+                    "id": node.id,
+                    "name": node.name,
+                    "summary": node.summary,
+                    "tags": node.tags,
+                })
         # Deduplicate by id
         seen = set()
         deduped = []
@@ -258,43 +285,55 @@ class WorkingMemory:
         self, tenant_id: str, user_id: str
     ) -> List[Dict[str, Any]]:
         """Fetch nodes tagged '计划' or '提醒' with properties.status=pending."""
-        reminders = []
         try:
             nodes = await self.graph.find_active_nodes(tenant_id, user_id)
-            for node in nodes:
-                tags = node.tags or []
-                props = node.properties or {}
-                if any(t in tags for t in ["计划", "提醒"]) and props.get("status") == "pending":
-                    reminders.append({
-                        "id": node.id,
-                        "name": node.name,
-                        "summary": node.summary,
-                        "tags": tags,
-                    })
+            return self._filter_pending_reminders(nodes)
         except Exception as e:
             logger.warning("fetch_pending_reminders failed: %s", e)
+            return []
+
+    @staticmethod
+    def _filter_pending_reminders(nodes: List) -> List[Dict[str, Any]]:
+        """Filter pending reminder nodes from a pre-fetched list."""
+        reminders = []
+        for node in nodes:
+            tags = node.tags or []
+            props = node.properties or {}
+            if any(t in tags for t in ["计划", "提醒"]) and props.get("status") == "pending":
+                reminders.append({
+                    "id": node.id,
+                    "name": node.name,
+                    "summary": node.summary,
+                    "tags": tags,
+                })
         return reminders[:10]
 
     async def _fetch_pending_reviews(
         self, tenant_id: str, user_id: str
     ) -> List[Dict[str, Any]]:
         """Fetch nodes with properties.needs_review=true (spaced repetition)."""
-        reviews = []
         try:
             nodes = await self.graph.find_active_nodes(tenant_id, user_id)
-            for node in nodes:
-                props = node.properties or {}
-                if props.get("needs_review"):
-                    reviews.append({
-                        "id": node.id,
-                        "name": node.name,
-                        "summary": node.summary,
-                        "importance": node.importance,
-                        "retrieval_strength": node.retrieval_strength,
-                        "review_count": props.get("review_count", 0),
-                    })
+            return self._filter_pending_reviews(nodes)
         except Exception as e:
             logger.warning("fetch_pending_reviews failed: %s", e)
+            return []
+
+    @staticmethod
+    def _filter_pending_reviews(nodes: List) -> List[Dict[str, Any]]:
+        """Filter review-pending nodes from a pre-fetched list."""
+        reviews = []
+        for node in nodes:
+            props = node.properties or {}
+            if props.get("needs_review"):
+                reviews.append({
+                    "id": node.id,
+                    "name": node.name,
+                    "summary": node.summary,
+                    "importance": node.importance,
+                    "retrieval_strength": node.retrieval_strength,
+                    "review_count": props.get("review_count", 0),
+                })
         return reviews[:10]
 
     @staticmethod
@@ -386,3 +425,22 @@ class WorkingMemory:
         except Exception as e:
             logger.error("Context synthesis failed: %s", e)
             return "\n".join(parts)
+
+
+def _goal_label(goal: Any) -> str:
+    """Format a goal dict into a short label for prompt injection.
+
+    Works for both graph-style goals ({"name", "summary", ...}) and
+    profile-store goals ({"name", "status", "progress"}).
+    """
+    if not isinstance(goal, dict):
+        return str(goal)
+    name = goal.get("name", "")
+    progress = goal.get("progress", "")
+    status = goal.get("status", "active")
+    label = name
+    if progress:
+        label += f"（{progress}）"
+    if status and status != "active":
+        label += f"[{status}]"
+    return label

@@ -282,7 +282,8 @@ class Retriever:
             logger.info("No candidates passed minimum score threshold for query: %s", query)
             # Try fallback retrieval with relaxed constraints
             scored = await self._retrieve_with_fallback(
-                query, entities, keywords, current_emotion, tenant_id, user_id, max_results
+                query, entities, keywords, current_emotion, tenant_id, user_id, max_results,
+                buffer_units=buffer_units,
             )
 
         if not scored:
@@ -748,6 +749,7 @@ class Retriever:
         tenant_id: str,
         user_id: str,
         max_results: int,
+        buffer_units: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
         """
         补偿检索策略：当正常检索失败时，尝试更宽松的检索条件。
@@ -832,11 +834,9 @@ class Retriever:
             return []
 
         # Score candidates with LOWER threshold (0.15 instead of 0.25)
-        buffer_units = []
-        try:
-            buffer_units = self.buffer.read_recent(tenant_id, user_id, limit=20)
-        except Exception:
-            pass
+        # buffer_units already read by the caller (retrieve()); reuse to avoid duplicate DB read
+        if buffer_units is None:
+            buffer_units = []
 
         scored = self._score_candidates(
             list(node_candidates.values()), buffer_units, query, entities, keywords, current_emotion

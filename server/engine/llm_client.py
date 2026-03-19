@@ -19,9 +19,9 @@ logger = logging.getLogger(__name__)
 # Module-level config, set via configure()
 _config: Dict[str, Any] = {
     "base_url": "https://api.minimaxi.com/v1",
-    "model": "MiniMax-M1",
+    "model": "MiniMax-M2.7-highspeed",
     "api_key": "",
-    "temperature": 0.3,
+    "temperature": 0.6,
 }
 _client: Optional[AsyncOpenAI] = None
 
