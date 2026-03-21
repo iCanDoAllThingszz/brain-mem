@@ -378,16 +378,42 @@ async def _process_after_response(
                         "reason": result.get("reason"),
                     })
                 else:
-                    entities = result.get("entities", [])
-                    entity_details = [
-                        f"{e.get('name')}({e.get('action','?')})"
-                        for e in entities[:5]
-                    ]
-                    log_event("encoder", f"Encoded: {user_message[:60]}", {
-                        "importance": result.get("importance"),
-                        "entities": entity_details,
-                        "relations": len(result.get("relations", [])),
-                    })
+                    result_type = result.get("type", "memory")
+                    if result_type == "memory":
+                        entities = result.get("entities", [])
+                        entity_details = [
+                            f"{e.get('name')}({e.get('action','?')})"
+                            for e in entities[:5]
+                        ]
+                        log_event("encoder", f"Encoded: {user_message[:60]}", {
+                            "importance": result.get("importance"),
+                            "entities": entity_details,
+                            "relations": len(result.get("relations", [])),
+                        })
+                    elif result_type == "log":
+                        log_event("encoder", f"Log: {user_message[:60]}", {
+                            "category": result.get("category"),
+                            "target_entities": result.get("target_entities"),
+                            "file_path": result.get("file_path"),
+                        })
+                    elif result_type == "reconsolidation":
+                        log_event("encoder", f"Reconsolidation: {user_message[:60]}", {
+                            "correction_type": result.get("correction_type"),
+                            "nodes_updated": result.get("nodes_updated"),
+                        })
+                    elif result_type == "prospective":
+                        log_event("encoder", f"Prospective: {user_message[:60]}", {
+                            "trigger_type": result.get("trigger_type"),
+                            "trigger_value": result.get("trigger_value"),
+                            "action": result.get("action"),
+                        })
+                    elif result_type == "forget":
+                        log_event("encoder", f"Forget: {user_message[:60]}", {
+                            "target_entities": result.get("target_entities"),
+                            "nodes_suppressed": result.get("nodes_suppressed"),
+                        })
+                    else:
+                        log_event("encoder", f"Encoded ({result_type}): {user_message[:60]}", {})
 
                     # Append encoded message to working memory so later messages in this
                     # session can reference what was already discussed and encoded

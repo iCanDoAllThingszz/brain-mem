@@ -124,8 +124,31 @@ async function ensureServer(cfg: BrainMemoryConfig, logger: any): Promise<boolea
 // Map OpenClaw sessionKey → brain-memory sessionId
 const sessionMap = new Map<string, string>();
 
-// Temporary store: sessionKey → last inbound user message (set at message:preprocessed, consumed at message:sent)
-const pendingUserMessages = new Map<string, string>();
+// Temporary store: sessionKey → {text, timestamp} (set at message:preprocessed, consumed at message:sent)
+const pendingUserMessages = new Map<string, { text: string; ts: number }>();
+
+// TTL for pending messages: 2 minutes. If message:sent doesn't fire within this window,
+// the entry is stale (e.g. AI response failed) and should be cleaned up.
+const PENDING_TTL_MS = 2 * 60 * 1000;
+
+function setPendingMessage(sessionKey: string, text: string): void {
+  pendingUserMessages.set(sessionKey, { text, ts: Date.now() });
+  // Opportunistic cleanup: purge stale entries from other sessions
+  if (pendingUserMessages.size > 20) {
+    const cutoff = Date.now() - PENDING_TTL_MS;
+    for (const [key, val] of pendingUserMessages) {
+      if (val.ts < cutoff) pendingUserMessages.delete(key);
+    }
+  }
+}
+
+function consumePendingMessage(sessionKey: string): string | null {
+  const entry = pendingUserMessages.get(sessionKey);
+  if (!entry) return null;
+  pendingUserMessages.delete(sessionKey);
+  if (Date.now() - entry.ts > PENDING_TTL_MS) return null;  // expired
+  return entry.text;
+}
 
 function getOrCreateSessionId(sessionKey: string): string {
   let sid = sessionMap.get(sessionKey);
@@ -320,10 +343,10 @@ const brainMemoryPlugin = {
 
         if (parts.length > 0) {
           api.logger.info?.(`brain-memory: injecting ${parts.length} context blocks`);
-          return { prependContext: parts.join("\n\n") };
+          return { appendSystemContext: parts.join("\n\n") };
         }
       } catch (err) {
-        api.logger.warn(`brain-memory: before_agent_start hook failed: ${String(err)}`);
+        api.logger.warn(`brain-memory: before_prompt_build hook failed: ${String(err)}`);
       }
     });
 
@@ -340,9 +363,8 @@ const brainMemoryPlugin = {
         if (!isUserSession(sessionKey)) return;
 
         // Retrieve the inbound user message stored at message:preprocessed time
-        const userMessage = pendingUserMessages.get(sessionKey);
+        const userMessage = consumePendingMessage(sessionKey);
         if (!userMessage) return;
-        pendingUserMessages.delete(sessionKey);
 
         const sessionId = getOrCreateSessionId(sessionKey);
         const assistantResponse: string = event.context?.content || "";
@@ -390,7 +412,7 @@ const brainMemoryPlugin = {
         ) return;
 
         // Stash for message:sent handler to pick up
-        pendingUserMessages.set(sessionKey, text);
+        setPendingMessage(sessionKey, text);
       },
       {
         name: "brain-memory.message-preprocessed",
@@ -408,6 +430,10 @@ const brainMemoryPlugin = {
 
         // Only process real user conversations
         if (!isUserSession(sessionKey)) return;
+
+        // Discard any pending user message to prevent it from being
+        // encoded into an orphan session after sessionMap is cleared
+        pendingUserMessages.delete(sessionKey);
 
         const sessionId = sessionMap.get(sessionKey);
         if (!sessionId) return;

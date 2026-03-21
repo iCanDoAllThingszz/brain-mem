@@ -188,17 +188,17 @@ class Evaluator:
         if encode_priority not in valid_priorities:
             encode_priority = "low"
 
-        # Re-apply encoding rules to ensure consistency
+        # Re-apply encoding rules deterministically (prompt order: first match wins)
         encode_decision = bool(result.get("encode_decision", False))
-        if task_relevance >= 7 or emotional_intensity >= 7 or novelty >= 8:
+        if task_relevance >= 7 or emotional_intensity >= 7:
             encode_decision = True
-            if task_relevance >= 7 or emotional_intensity >= 7:
-                encode_priority = "high"
+            encode_priority = "high"
+        elif novelty >= 8:
+            encode_decision = True
+            encode_priority = "medium"
         elif task_relevance >= 5 or novelty >= 5:
             encode_decision = True
-            if encode_priority == "high":
-                pass  # keep high if LLM said so
-            else:
+            if encode_priority != "high":
                 encode_priority = "low"
 
         return {
