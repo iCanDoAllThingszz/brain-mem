@@ -592,3 +592,52 @@ async def backfill_embeddings(request: Request):
     except Exception as e:
         logger.error("Backfill failed: %s", e)
         return {"code": 1, "message": str(e)}
+
+
+# ============================================================================
+# Hook Status Check Endpoints
+# ============================================================================
+
+@app.get("/hooks/status/session-start")
+async def check_session_start_status():
+    """检查session-start hook的最近工作记录"""
+    logs = [log for log in read_recent(50) if log.get("event") == "hook_session_start"]
+    return ok({
+        "hook": "session-start",
+        "recent_calls": len(logs),
+        "last_10_records": logs[:10]
+    })
+
+
+@app.get("/hooks/status/before-query")
+async def check_before_query_status():
+    """检查before-query hook的最近工作记录"""
+    logs = [log for log in read_recent(50) if "before-query" in log.get("message", "")]
+    return ok({
+        "hook": "before-query",
+        "recent_calls": len(logs),
+        "last_10_records": logs[:10]
+    })
+
+
+@app.get("/hooks/status/after-response")
+async def check_after_response_status():
+    """检查after-response hook的最近工作记录"""
+    logs = [log for log in read_recent(50) if "after-response" in log.get("message", "")]
+    return ok({
+        "hook": "after-response",
+        "recent_calls": len(logs),
+        "last_10_records": logs[:10]
+    })
+
+
+@app.get("/hooks/status/session-end")
+async def check_session_end_status():
+    """检查session-end hook的最近工作记录"""
+    logs = [log for log in read_recent(50) if "session-end" in log.get("message", "")]
+    return ok({
+        "hook": "session-end",
+        "recent_calls": len(logs),
+        "last_10_records": logs[:10]
+    })
+
