@@ -152,9 +152,18 @@ class ProspectiveChecker:
                 status = properties.get("status", "pending")
                 action = properties.get("action", "")
                 node_id = node_props.get("id")
+                repeat_num = properties.get("repeat_num")
+                created_at = node_props.get("created_at", "未知")  # 记忆创建时间
 
-                # Only check event triggers that are pending
+                # 只检查事件触发器且未完成的
                 if trigger_type != "event" or status != "pending":
+                    continue
+
+                # 如果有 repeat_num 字段，检查是否还有剩余次数
+                # repeat_num=0 表示无限重复，repeat_num>0 表示有剩余次数
+                # 如果没有 repeat_num 字段（旧数据），按 status 判断
+                if repeat_num is not None and repeat_num < 0:
+                    # repeat_num < 0 不合法，跳过
                     continue
 
                 # Simple keyword matching (case-insensitive)
@@ -169,12 +178,33 @@ class ProspectiveChecker:
                         "trigger_type": "event",
                     })
 
-                    # Update status to completed
-                    await self._update_trigger_status(node_id, "completed")
-                    logger.info(
-                        "Event trigger activated: %s (trigger=%s, query=%s)",
-                        action, trigger_value, current_query[:50]
-                    )
+                    # 检查重复次数
+                    repeat_num = properties.get("repeat_num", 0)
+
+                    if repeat_num > 0:
+                        # 有剩余次数：递减并记录触发时间
+                        new_repeat_num = repeat_num - 1
+                        await self._decrement_repeat_num(node_id, new_repeat_num)
+
+                        if new_repeat_num == 0:
+                            # 次数用完，标记为 completed
+                            await self._update_trigger_status(node_id, "completed")
+                            logger.info(
+                                "Event trigger exhausted: %s (trigger=%s, created=%s, final use)",
+                                action, trigger_value, created_at
+                            )
+                        else:
+                            logger.info(
+                                "Event trigger activated: %s (trigger=%s, created=%s, %d uses left)",
+                                action, trigger_value, created_at, new_repeat_num
+                            )
+                    else:
+                        # repeat_num=0 表示无限重复
+                        await self._update_last_triggered(node_id)
+                        logger.info(
+                            "Event trigger activated (infinite): %s (trigger=%s, created=%s)",
+                            action, trigger_value, created_at
+                        )
 
         return triggered
 
@@ -215,3 +245,57 @@ class ProspectiveChecker:
                     # Update with new properties
                     update_query = "MATCH (n:MemoryNode {id: $node_id}) SET n.properties = $props"
                     await session.run(update_query, node_id=node_id, props=json.dumps(props))
+
+    async def _update_last_triggered(self, node_id: str) -> None:
+        """
+        更新重复提醒的最后触发时间。
+
+        Args:
+            node_id: 节点ID
+        """
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc).isoformat()
+        query = """
+        MATCH (n:MemoryNode {id: $node_id})
+        SET n.properties = apoc.convert.toJson(
+            apoc.convert.fromJsonMap(n.properties) + {last_triggered: $timestamp}
+        )
+        RETURN n
+        """
+
+        driver = self.graph._ensure_connected()
+        async with driver.session() as session:
+            try:
+                await session.run(query, node_id=node_id, timestamp=now)
+            except Exception as e:
+                logger.warning("Failed to update last_triggered: %s", e)
+
+    async def _decrement_repeat_num(self, node_id: str, new_repeat_num: int) -> None:
+        """
+        递减重复次数并更新最后触发时间。
+
+        Args:
+            node_id: 节点ID
+            new_repeat_num: 新的剩余次数
+        """
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc).isoformat()
+        query = """
+        MATCH (n:MemoryNode {id: $node_id})
+        SET n.properties = apoc.convert.toJson(
+            apoc.convert.fromJsonMap(n.properties) + {
+                repeat_num: $repeat_num,
+                last_triggered: $timestamp
+            }
+        )
+        RETURN n
+        """
+
+        driver = self.graph._ensure_connected()
+        async with driver.session() as session:
+            try:
+                await session.run(query, node_id=node_id, repeat_num=new_repeat_num, timestamp=now)
+            except Exception as e:
+                logger.warning("Failed to decrement repeat_num: %s", e)

@@ -440,11 +440,11 @@ class GraphStore:
         self, tenant_id: str, user_id: str, base_half_life_days: int = 30
     ) -> None:
         """
-        Apply memory decay with importance-weighted and zone-differentiated half-lives.
+        应用记忆衰减，基于重要性和区域差异化的半衰期。
 
-        Effective half-life = base × (1 + importance/10) × zone_factor
-        Zone factors: episodic=0.5, semantic=2.0, procedural=3.0, emotional=1.0
-        Nodes with retrieval_strength < 0.1 transition to 'dormant'.
+        有效半衰期 = base × (1 + importance/10) × zone_factor
+        区域因子: episodic=0.5, semantic=2.0, procedural=3.0, emotional=1.0
+        retrieval_strength < 0.1 的节点转为 'dormant' 状态。
         """
         driver = self._ensure_connected()
         now = datetime.utcnow().isoformat()
@@ -461,7 +461,7 @@ class GraphStore:
         WITH n, days_elapsed,
              $base_half_life * (1.0 + n.importance / 10.0) * zone_factor AS effective_half_life
         WITH n, days_elapsed, effective_half_life,
-             n.retrieval_strength * n.decay_factor * exp(-0.693147 / effective_half_life * toFloat(days_elapsed)) AS new_strength
+             n.retrieval_strength * exp(-0.693147 / effective_half_life * toFloat(days_elapsed)) AS new_strength
         SET n.retrieval_strength = new_strength,
             n.status = CASE WHEN new_strength < 0.1 THEN 'dormant' ELSE n.status END
         """

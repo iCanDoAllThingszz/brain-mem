@@ -28,6 +28,7 @@ _EXTRACT_CLUES_SYSTEM = """\
 - 如果查询是纯社交性质（如"嗯嗯"、"好的"、"咋不回我"），返回空列表
 - 如果查询是当前会话的延续（如"一起修复"、"继续"），返回空列表
 - 识别查询中的情感信息（如"开心"、"沮丧"、"生气"、"害怕"、"惊讶"）
+- 利用上下文信息解析指代关系（如"他"、"那个"、"这件事"）
 
 只返回有效的JSON：
 {
@@ -91,38 +92,43 @@ class Retriever:
         session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Retrieve memories relevant to the query using multi-path search.
+        使用多路径检索查询相关记忆。
 
-        Multi-path retrieval flow:
-        1. Check query cache to prevent duplicate calls within 10s.
-        2. Extract entity clues and keywords from the query via LLM.
-        3. Path A: Exact name match → find_nodes_by_name
-        4. Path B: Alias match → find_nodes_by_alias
-        5. Path C: Fuzzy keyword match → find_nodes_fuzzy
-        6. Relation traversal from matched nodes (1-2 hops).
-        7. Buffer retrieval: recent unarchived memory units.
-        8. Deduplicate and score all candidates.
-        9. Filter by minimum score threshold.
-        10. LLM reconstructs top-K fragments into a coherent context.
-        11. Update access records for retrieved nodes.
+        检索流程：
+        1. 检查查询缓存（10秒内相同查询直接返回）
+        2. 使用LLM从查询中提取实体线索和关键词（利用working_memory解析指代）
+        3. 多路径并行图检索：
+           - 路径A: 精确名称匹配 → find_nodes_by_name
+           - 路径B: 别名匹配 → find_nodes_by_alias
+           - 路径C: 模糊关键词匹配 → find_nodes_fuzzy
+           - 路径D: 休眠节点搜索（用于唤醒）
+           - 路径E: 向量语义搜索（针对每个实体+query整体）
+        4. 关系遍历：从匹配节点出发遍历1-2跳关系
+        5. Buffer检索：获取最近未归档的记忆单元
+        6. 去重并综合打分所有候选
+        7. 按最小分数阈值过滤
+        8. LLM重构top-K片段为连贯上下文
+        9. 更新被检索节点的访问记录
 
-        Composite score = relevance×0.5 + importance×0.15 + recency×0.15
-                        + access_frequency×0.1 + emotional_resonance×0.1
+        综合评分公式：
+        - 中性情绪: relevance×0.5 + importance×0.15 + recency×0.15 + access_freq×0.1 + emotional×0.1
+        - 非中性情绪: relevance×0.4 + importance×0.15 + recency×0.15 + access_freq×0.1 + emotional×0.2
 
         Args:
-            query: Natural language query string.
-            tenant_id: Tenant identifier.
-            user_id: User identifier.
-            working_memory: Optional session context for scoring.
-            max_results: Maximum number of memory fragments to include.
-            session_id: Optional session identifier for caching.
+            query: 自然语言查询字符串
+            tenant_id: 租户标识
+            user_id: 用户标识
+            working_memory: 可选的会话上下文，用于评分和指代解析
+            max_results: 最多返回的记忆片段数
+            session_id: 可选的会话标识，用于缓存
 
         Returns:
-            Dict with keys:
-                - "context": str — natural language context ready for LLM injection
+            包含以下键的字典：
+                - "context": str — 可直接注入LLM的自然语言上下文
                 - "memories": list of {"id", "content", "relevance", "confidence"}
         """
-        # Step 1: Check query cache
+        # 步骤1: 检查查询缓存
+        cache_key = None
         if session_id:
             query_hash = hashlib.md5(query.encode()).hexdigest()
             cache_key = (session_id, query_hash)
@@ -133,48 +139,48 @@ class Retriever:
                     logger.info("Returning cached result for session=%s query_hash=%s", session_id, query_hash[:8])
                     return cached_result
 
-        # Step 2: Extract search clues
-        clues = await self._extract_clues(query)
-        # Guard against LLM returning non-dict (e.g., list)
+        # 步骤2: 提取搜索线索（传入working_memory用于指代解析）
+        clues = await self._extract_clues(query, working_memory)
         if not isinstance(clues, dict):
             logger.warning('_extract_clues returned %s instead of dict, using fallback', type(clues).__name__)
             clues = {"entities": [], "keywords": [query], "time_hint": "none", "query_intent": query, "query_emotion": "neutral"}
+
         entities = clues.get("entities", [])
         keywords = clues.get("keywords", [])
         query_emotion = clues.get("query_emotion", "neutral")
 
-        # Determine current emotion from query or working memory
+        # 确定当前情绪（用于情感共鸣评分）
         current_emotion = query_emotion
         if current_emotion == "neutral" and working_memory:
-            # Fallback to working memory emotional baseline
             baseline = working_memory.get("emotional_baseline", "neutral")
-            # Map baseline to emotion type
             if baseline == "positive":
                 current_emotion = "joy"
             elif baseline == "negative":
                 current_emotion = "sadness"
-            # else: keep neutral
 
-        # If no meaningful clues extracted, return empty result
+        # 如果没有提取到有意义的线索，返回空结果
         if not entities and not keywords:
             logger.info("No meaningful clues extracted from query: %s", query)
             result = {"context": "No relevant memories found.", "memories": []}
-            if session_id:
+            if session_id and cache_key:
                 self._query_cache[cache_key] = (result, datetime.utcnow())
             return result
 
-        # Steps 3-6: Multi-path graph retrieval (run in parallel where possible)
-        node_candidates: Dict[str, Any] = {}  # node_id → scored candidate
-        fuzzy_matches: Dict[str, str] = {}  # node_id → fuzzy_query_term (for alias learning)
+        # 步骤3-5: 多路径图检索（并行执行）
+        node_candidates: Dict[str, Any] = {}
+        fuzzy_matches: Dict[str, str] = {}
 
         graph_tasks = []
-        task_metadata = []  # Track which search method and term for each task
+        task_metadata = []
 
+        # 为每个实体执行精确名称和别名搜索
         for entity in entities:
             graph_tasks.append(self._search_by_name(entity, tenant_id, user_id))
             task_metadata.append(("name", entity))
             graph_tasks.append(self._search_by_alias(entity, tenant_id, user_id))
             task_metadata.append(("alias", entity))
+
+        # 为每个关键词执行模糊搜索
         for kw in keywords:
             graph_tasks.append(self._search_fuzzy(kw, tenant_id, user_id))
             task_metadata.append(("fuzzy", kw))
@@ -189,26 +195,46 @@ class Retriever:
                 for node in result:
                     if node.id not in node_candidates:
                         node_candidates[node.id] = node
-                        # Track fuzzy matches for alias learning
                         if search_method == "fuzzy":
                             fuzzy_matches[node.id] = search_term
 
-        # Search dormant nodes too (for revival)
-        all_search_terms = entities + keywords
-        if all_search_terms:
-            try:
-                dormant_matches = await self.graph.find_dormant_nodes(
-                    all_search_terms, tenant_id, user_id, limit=5)
-                for node in dormant_matches:
-                    if node.id not in node_candidates:
-                        node_candidates[node.id] = node
-            except Exception as e:
-                logger.warning("Dormant search failed: %s", e)
+        # 路径E: 向量语义搜索（针对实体+query，与图搜索并行）
+        try:
+            from server.engine.embedding_client import get_embedding
+            import numpy as np
 
-        # Step 6: Relation traversal from matched nodes
+            # E1: 为每个实体做向量搜索（更精准）
+            vector_tasks = []
+            for entity in entities[:3]:  # 限制前3个实体避免过多查询
+                vector_tasks.append(self._search_by_vector(entity, tenant_id, user_id))
+
+            # E2: 对整个query也做向量搜索（捕获语义相似）
+            vector_tasks.append(self._search_by_vector(query, tenant_id, user_id))
+
+            if vector_tasks:
+                vector_results = await asyncio.gather(*vector_tasks, return_exceptions=True)
+                for vresult in vector_results:
+                    if isinstance(vresult, Exception):
+                        continue
+                    for node in vresult:
+                        if node.id not in node_candidates:
+                            node_candidates[node.id] = node
+        except ImportError:
+            logger.debug("Embedding client not available, skipping vector search")
+
+        # 步骤4: 关系遍历（从匹配节点出发，优先遍历重要节点）
+        # 按重要性排序，优先遍历高价值节点
+        sorted_candidates = sorted(
+            node_candidates.items(),
+            key=lambda x: getattr(x[1], 'importance', 5.0),
+            reverse=True
+        )
         traversal_tasks = [
-            self._traverse(node_id) for node_id in list(node_candidates.keys())[:5]
+            self._traverse(node_id) for node_id, _ in sorted_candidates[:5]
         ]
+
+        # 收集关系信息用于上下文重构
+        relations = []
         if traversal_tasks:
             traversal_results = await asyncio.gather(*traversal_tasks, return_exceptions=True)
             for tresult in traversal_results:
@@ -217,37 +243,33 @@ class Retriever:
                 for row in tresult:
                     node_id = row.get("to_id")
                     if node_id and node_id not in node_candidates:
-                        # Create a lightweight placeholder from traversal data
                         node_candidates[node_id] = self._node_from_traversal(row)
 
-        # Step 7: Buffer retrieval
+                    # 收集关系信息（包含description和properties）
+                    from_id = row.get("from_id")
+                    rel_type = row.get("rel_type", "")
+                    rel_props = row.get("rel_props", {})
+                    if from_id and node_id and rel_type:
+                        relations.append({
+                            "from_id": from_id,
+                            "to_id": node_id,
+                            "type": rel_type,
+                            "description": rel_props.get("description", ""),  # 独立字段
+                            "properties": rel_props  # 完整属性
+                        })
+
+        # 步骤5: Buffer检索（短期记忆）
         buffer_units = []
         try:
             buffer_units = self.buffer.read_recent(tenant_id, user_id, limit=20)
-        except Exception as e:
-            logger.warning("Buffer retrieval failed: %s", e)
 
-        # Step 7.5: Vector semantic search (Path E)
-        try:
-            from server.engine.embedding_client import get_embedding
-            import numpy as np
+            # Buffer向量搜索（numpy暴力匹配）
+            try:
+                from server.engine.embedding_client import get_embedding
+                import numpy as np
 
-            query_embedding = await get_embedding(query, type_="query")
-            if any(v != 0.0 for v in query_embedding[:10]):  # not a zero vector
-                # E1: Neo4j vector search (long-term memory)
-                try:
-                    vector_hits = await self.graph.vector_search(query_embedding, top_k=5, min_score=0.5)
-                    for hit in vector_hits:
-                        node_data = hit["node"]
-                        nid = node_data.get("id", "")
-                        if nid and nid not in node_candidates:
-                            node_candidates[nid] = self._node_from_dict(node_data)
-                            logger.info("Vector search found node: %s (score=%.2f)", node_data.get("name"), hit["score"])
-                except Exception as e:
-                    logger.warning("Neo4j vector search failed: %s", e)
-
-                # E2: Buffer vector search (short-term memory, numpy brute force)
-                try:
+                query_embedding = await get_embedding(query, type_="query")
+                if any(v != 0.0 for v in query_embedding[:10]):
                     buf_embeddings = self.buffer.get_embeddings(tenant_id, user_id)
                     if buf_embeddings:
                         q_emb = np.array(query_embedding, dtype=np.float32)
@@ -259,48 +281,69 @@ class Retriever:
                                 if b_norm > 0:
                                     score = float(np.dot(q_emb, b_emb) / (q_norm * b_norm))
                                     if score > 0.5:
-                                        # Find the buffer unit and add if not already present
                                         for bu in buffer_units:
                                             if bu.get("id") == buf_id:
                                                 bu["_vector_score"] = score
                                                 break
-                except Exception as e:
-                    logger.warning("Buffer vector search failed: %s", e)
-        except ImportError:
-            pass  # embedding_client not available
+            except Exception as e:
+                logger.warning("Buffer vector search failed: %s", e)
+        except Exception as e:
+            logger.warning("Buffer retrieval failed: %s", e)
 
-        # Step 8: Score and rank
+        # 步骤6: 综合评分和排序
         scored = self._score_candidates(
             list(node_candidates.values()), buffer_units, query, entities, keywords, current_emotion
         )
 
-        # Step 9: Filter by minimum score threshold
+        # 步骤7: 按最小分数阈值过滤
         MIN_SCORE_THRESHOLD = 0.25
         scored = [c for c in scored if c["score"] >= MIN_SCORE_THRESHOLD]
 
+        # 如果没有候选通过阈值，尝试降低阈值或搜索休眠节点
         if not scored:
-            logger.info("No candidates passed minimum score threshold for query: %s", query)
-            # Try fallback retrieval with relaxed constraints
-            scored = await self._retrieve_with_fallback(
-                query, entities, keywords, current_emotion, tenant_id, user_id, max_results,
-                buffer_units=buffer_units,
+            logger.info("No candidates passed threshold, trying fallback strategies")
+
+            # 策略1: 降低阈值重试
+            MIN_SCORE_THRESHOLD = 0.15
+            scored = self._score_candidates(
+                list(node_candidates.values()), buffer_units, query, entities, keywords, current_emotion
             )
+            scored = [c for c in scored if c["score"] >= MIN_SCORE_THRESHOLD]
+            for c in scored:
+                c["confidence"] = 0.5
+
+            # 策略2: 如果仍然没有结果，尝试唤醒休眠节点
+            if not scored:
+                all_search_terms = entities + keywords
+                if all_search_terms:
+                    try:
+                        dormant_matches = await self.graph.find_dormant_nodes(
+                            all_search_terms, tenant_id, user_id, limit=5)
+                        if dormant_matches:
+                            logger.info("Found %d dormant nodes, attempting revival", len(dormant_matches))
+                            # 对休眠节点评分
+                            dormant_scored = self._score_candidates(
+                                dormant_matches, [], query, entities, keywords, current_emotion
+                            )
+                            scored = [c for c in dormant_scored if c["score"] >= 0.15]
+                            for c in scored:
+                                c["confidence"] = 0.6  # 休眠节点置信度稍高
+                    except Exception as e:
+                        logger.warning("Dormant node search failed: %s", e)
 
         if not scored:
             result = {"context": "No relevant memories found.", "memories": []}
-            if session_id:
+            if session_id and cache_key:
                 self._query_cache[cache_key] = (result, datetime.utcnow())
             return result
 
         top_k = scored[:max_results]
 
-        # Step 10: LLM reconstruction
-        context = await self._reconstruct_context(query, top_k)
+        # 步骤8: LLM重构为连贯上下文（传入关系信息）
+        context = await self._reconstruct_context(query, top_k, relations)
 
-        # Step 11: Update access records for graph nodes
-        node_ids_to_update = [
-            c["id"] for c in top_k if c.get("source") == "graph"
-        ]
+        # 步骤9: 批量更新访问记录
+        node_ids_to_update = [c["id"] for c in top_k if c.get("source") == "graph"]
         await self._update_access_batch(node_ids_to_update, fuzzy_matches)
 
         memories = [
@@ -315,10 +358,9 @@ class Retriever:
 
         result = {"context": context, "memories": memories}
 
-        # Cache the result
-        if session_id:
+        # 缓存结果
+        if session_id and cache_key:
             self._query_cache[cache_key] = (result, datetime.utcnow())
-            # Clean up old cache entries
             self._cleanup_cache()
 
         return result
@@ -337,19 +379,49 @@ class Retriever:
         for k in expired_keys:
             del self._query_cache[k]
 
-    async def _extract_clues(self, query: str) -> Dict[str, Any]:
-        """Use LLM to extract entity names and keywords from the query."""
+    async def _extract_clues(
+        self, query: str, working_memory: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        使用LLM从查询中提取实体名称和关键词。
+
+        Args:
+            query: 用户查询
+            working_memory: 工作记忆，包含会话上下文用于解析指代关系
+
+        Returns:
+            包含 entities, keywords, time_hint, query_intent, query_emotion 的字典
+        """
         try:
-            return await call_llm_json(
-                _EXTRACT_CLUES_SYSTEM,
-                f'Query:\n"""\n{query}\n"""',
-            )
+            # 构建上下文信息，帮助LLM理解指代关系
+            context_parts = []
+            if working_memory:
+                # 本session最近的消息，用于解析"他"、"那个"等指代
+                session_msgs = working_memory.get("session_messages", [])
+                if session_msgs:
+                    recent = " | ".join(session_msgs[-3:])
+                    context_parts.append(f"最近对话: {recent}")
+
+                # 用户画像和目标，帮助理解查询意图
+                raw = working_memory.get("raw", {})
+                if raw.get("user_profile"):
+                    context_parts.append(f"用户画像: {raw['user_profile']}")
+                if working_memory.get("user_goals"):
+                    goals = "; ".join(working_memory["user_goals"][:3])
+                    context_parts.append(f"当前目标: {goals}")
+
+            context_block = ""
+            if context_parts:
+                context_block = "\n\n上下文（用于解析指代）:\n" + "\n".join(context_parts)
+
+            user_prompt = f'Query:\n"""\n{query}\n"""{context_block}'
+            return await call_llm_json(_EXTRACT_CLUES_SYSTEM, user_prompt)
         except Exception as e:
             logger.warning("Clue extraction failed: %s", e)
-            # Fallback: use the whole query as a keyword
             return {"entities": [], "keywords": [query], "time_hint": "none", "query_intent": query}
 
     async def _search_by_name(self, name: str, tenant_id: str, user_id: str) -> list:
+        """通过精确名称搜索节点"""
         try:
             return await self.graph.find_nodes_by_name(name, tenant_id, user_id)
         except Exception as e:
@@ -357,6 +429,7 @@ class Retriever:
             return []
 
     async def _search_by_alias(self, alias: str, tenant_id: str, user_id: str) -> list:
+        """通过别名搜索节点"""
         try:
             return await self.graph.find_nodes_by_alias(alias, tenant_id, user_id)
         except Exception as e:
@@ -364,13 +437,56 @@ class Retriever:
             return []
 
     async def _search_fuzzy(self, keyword: str, tenant_id: str, user_id: str) -> list:
+        """通过模糊关键词搜索节点"""
         try:
             return await self.graph.find_nodes_fuzzy(keyword, tenant_id, user_id)
         except Exception as e:
             logger.warning("find_nodes_fuzzy('%s') failed: %s", keyword, e)
             return []
 
+    async def _search_by_vector(self, text: str, tenant_id: str, user_id: str) -> list:
+        """
+        通过向量语义搜索节点。
+
+        Args:
+            text: 要搜索的文本（实体名或query）
+            tenant_id: 租户ID
+            user_id: 用户ID
+
+        Returns:
+            匹配的节点列表
+        """
+        try:
+            from server.engine.embedding_client import get_embedding
+            import numpy as np
+
+            embedding = await get_embedding(text, type_="query")
+            # 检查是否为零向量（使用范数判断）
+            if np.linalg.norm(embedding) > 0:
+                vector_hits = await self.graph.vector_search(embedding, top_k=5, min_score=0.5)
+                nodes = []
+                for hit in vector_hits:
+                    node_data = hit["node"]
+                    if node_data.get("id"):
+                        nodes.append(self._node_from_dict(node_data))
+                        logger.debug("Vector search '%s' found: %s (score=%.2f)",
+                                   text[:20], node_data.get("name"), hit["score"])
+                return nodes
+            return []
+        except Exception as e:
+            logger.warning("Vector search for '%s' failed: %s", text, e)
+            return []
+
     async def _traverse(self, node_id: str) -> list:
+        """
+        从节点出发遍历关系图。
+
+        Args:
+            node_id: 起始节点ID
+
+        Returns:
+            遍历到的关系列表
+        """
         try:
             return await self.graph.traverse_relations(node_id, max_depth=2)
         except Exception as e:
@@ -379,7 +495,7 @@ class Retriever:
 
     @staticmethod
     def _node_from_traversal(row: Dict[str, Any]) -> Any:
-        """Create a lightweight dict-like object from a traversal row."""
+        """从遍历结果行创建轻量级节点代理对象"""
         props = row.get("node_props", {})
 
         class _NodeProxy:
@@ -399,7 +515,7 @@ class Retriever:
 
     @staticmethod
     def _node_from_dict(node_data: Dict[str, Any]) -> Any:
-        """Create a lightweight dict-like object from a Neo4j node dict (e.g., from vector search)."""
+        """从Neo4j节点字典创建轻量级节点代理对象（用于向量搜索结果）"""
         class _NodeProxy:
             def __init__(self, p: dict) -> None:
                 self.id = p.get("id", "")
@@ -424,13 +540,22 @@ class Retriever:
         current_emotion: str = "neutral",
     ) -> List[Dict[str, Any]]:
         """
-        Score and merge graph nodes + buffer units into a unified ranked list.
+        对图节点和buffer单元进行综合评分并合并为统一排序列表。
 
-        Composite score:
-        - When current_emotion is neutral:
-          relevance×0.5 + importance×0.15 + recency×0.15 + access_frequency×0.1 + emotional_resonance×0.1
-        - When current_emotion is non-neutral:
-          relevance×0.4 + importance×0.15 + recency×0.15 + access_frequency×0.1 + emotional_resonance×0.2
+        综合评分公式：
+        - 中性情绪时：relevance×0.5 + importance×0.15 + recency×0.15 + access_freq×0.1 + emotional×0.1
+        - 非中性情绪时：relevance×0.4 + importance×0.15 + recency×0.15 + access_freq×0.1 + emotional×0.2
+
+        Args:
+            nodes: 图节点列表
+            buffer_units: buffer记忆单元列表
+            query: 查询字符串
+            entities: 提取的实体列表
+            keywords: 提取的关键词列表
+            current_emotion: 当前情绪状态
+
+        Returns:
+            按分数降序排列的候选列表
         """
         # Determine if emotional resonance should be weighted higher
         emotional_weight = 0.2 if current_emotion != "neutral" else 0.1
@@ -511,12 +636,21 @@ class Retriever:
     @staticmethod
     def _text_relevance(text: str, query: str, entities: List[str], keywords: List[str]) -> float:
         """
-        Enhanced keyword relevance score (0-1) with better matching.
+        计算文本相关性评分（0-1）。
 
-        Uses multiple strategies:
-        1. Exact entity/keyword match (high weight)
-        2. Partial substring match (medium weight)
-        3. Query term overlap (low weight)
+        使用多种匹配策略：
+        1. 精确实体/关键词匹配（高权重）
+        2. 部分子串匹配（中权重）
+        3. 查询词重叠（低权重）
+
+        Args:
+            text: 待评分文本
+            query: 原始查询
+            entities: 提取的实体列表
+            keywords: 提取的关键词列表
+
+        Returns:
+            相关性评分 0-1
         """
         if not text:
             return 0.0
@@ -559,7 +693,15 @@ class Retriever:
 
     @staticmethod
     def _recency_score(timestamp_str: str) -> float:
-        """Convert a timestamp to a 0-1 recency score (1 = just now, decays over 30 days)."""
+        """
+        将时间戳转换为0-1的新近度评分（1=刚刚，30天内线性衰减）。
+
+        Args:
+            timestamp_str: ISO格式时间戳字符串
+
+        Returns:
+            新近度评分 0-1
+        """
         if not timestamp_str:
             return 0.0
         try:
@@ -573,20 +715,20 @@ class Retriever:
     @staticmethod
     def _emotional_resonance(emotional_tag: Any, current_emotion: str) -> float:
         """
-        Calculate emotional resonance between node emotion and current emotion (0-1).
+        计算节点情感与当前情感的共鸣度（0-1）。
 
-        Rules:
-        1. Emotion type matching: same emotion type → high resonance
-        2. Emotion intensity: stronger node emotion → more noticeable resonance
-        3. Special rule: when current emotion is negative, positive "encouraging" memories
-           also get a boost (e.g., past successes when user is sad)
+        规则：
+        1. 情感类型匹配：相同情感类型 → 高共鸣
+        2. 情感强度：节点情感越强 → 共鸣越明显
+        3. 特殊规则：当前情感为负面时，正面"鼓励性"记忆也会获得加成
+           （例如用户悲伤时，过去的成功记忆）
 
         Args:
-            emotional_tag: Node's emotional_tag dict with "type" and "intensity"
-            current_emotion: Current emotion from query or working memory
+            emotional_tag: 节点的emotional_tag字典，包含"type"和"intensity"
+            current_emotion: 当前情感（从查询或工作记忆获取）
 
         Returns:
-            Resonance score 0-1
+            共鸣度评分 0-1
         """
         if not isinstance(emotional_tag, dict):
             return 0.0
@@ -629,20 +771,72 @@ class Retriever:
         return intensity_normalized * 0.2
 
     async def _reconstruct_context(
-        self, query: str, candidates: List[Dict[str, Any]]
+        self, query: str, candidates: List[Dict[str, Any]], relations: List[Dict[str, str]] = None
     ) -> str:
-        """Use LLM to synthesize top-K memory fragments into a factual context summary."""
+        """
+        使用LLM将top-K记忆片段合成为事实性上下文摘要。
+
+        Args:
+            query: 用户查询
+            candidates: 候选记忆列表
+            relations: 节点间的关系列表
+
+        Returns:
+            合成的上下文字符串
+        """
         if not candidates:
             return "No relevant memories found."
+
+        # 构建节点ID到内容的映射
+        id_to_content = {c["id"]: c["content"] for c in candidates}
 
         fragments = "\n".join(
             f"[{i+1}] {c['content']}" for i, c in enumerate(candidates)
         )
-        # Pass query context to help LLM judge relevance, but instruct it NOT to answer
+
+        # 构建关系描述
+        relation_text = ""
+        if relations:
+            rel_lines = []
+            for rel in relations[:10]:  # 限制关系数量
+                from_id = rel.get("from_id")
+                to_id = rel.get("to_id")
+                rel_type = rel.get("type", "关联")
+                rel_desc = rel.get("description", "")
+                rel_props = rel.get("properties", {})
+
+                # 只包含在候选中的关系
+                if from_id in id_to_content and to_id in id_to_content:
+                    from_name = id_to_content[from_id].split(":")[0]
+                    to_name = id_to_content[to_id].split(":")[0]
+
+                    # 构建关系描述
+                    if rel_desc:
+                        # 优先使用 description 字段
+                        rel_line = f"{from_name} --{rel_type}--> {to_name}: {rel_desc}"
+                    else:
+                        rel_line = f"{from_name} --{rel_type}--> {to_name}"
+
+                    # 补充时间等关键属性
+                    extra_info = []
+                    if rel_props.get("valid_from"):
+                        extra_info.append(f"始于 {rel_props['valid_from'][:10]}")
+                    if rel_props.get("confidence") and rel_props["confidence"] < 0.8:
+                        extra_info.append(f"置信度 {rel_props['confidence']:.1f}")
+
+                    if extra_info:
+                        rel_line += f" ({', '.join(extra_info)})"
+
+                    rel_lines.append(rel_line)
+
+            if rel_lines:
+                relation_text = "\n\n关系网络：\n" + "\n".join(rel_lines)
+
         user_prompt = (
             f"用户当前查询：{query}\n\n"
-            f"记忆片段：\n{fragments}\n\n"
+            f"记忆片段：\n{fragments}{relation_text}\n\n"
             "请将这些记忆片段合成为简洁的事实性上下文段落（50-100字）。\n"
+            "利用关系网络理解节点间的联系。\n"
             "只包含与查询相关且能提供新信息的事实。\n"
             "如果记忆片段都是关于当前正在讨论的话题（用户已经知道的内容），返回\"No relevant memories found.\"\n"
             "不要回答问题，不要提供建议。"
@@ -659,7 +853,13 @@ class Retriever:
             return "\n".join(c["content"] for c in candidates)
 
     async def _update_access_batch(self, node_ids: List[str], fuzzy_matches: Dict[str, str]) -> None:
-        """Update access records and revive dormant nodes if retrieved."""
+        """
+        批量更新访问记录并唤醒休眠节点。
+
+        Args:
+            node_ids: 要更新的节点ID列表
+            fuzzy_matches: 模糊匹配映射（用于别名学习）
+        """
         tasks = []
         for nid in node_ids:
             if nid:
@@ -668,7 +868,13 @@ class Retriever:
         await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _update_and_revive(self, node_id: str, fuzzy_term: Optional[str] = None) -> None:
-        """Update access for a node and revive it if dormant. Also handle spaced repetition review and alias learning."""
+        """
+        更新节点访问记录并唤醒休眠节点。同时处理间隔重复复习和别名学习。
+
+        Args:
+            node_id: 节点ID
+            fuzzy_term: 可选的模糊匹配词（用于别名学习）
+        """
         try:
             # Get the node to check if it needs review
             node = await self.graph.get_node(node_id)
@@ -735,132 +941,3 @@ class Retriever:
                 logger.info("Revived dormant node %s via retrieval", node_id)
         except Exception as e:
             logger.warning("update_access/revive('%s') failed: %s", node_id, e)
-
-    # ------------------------------------------------------------------
-    # Retrieval fallback mechanism
-    # ------------------------------------------------------------------
-
-    async def _retrieve_with_fallback(
-        self,
-        query: str,
-        entities: List[str],
-        keywords: List[str],
-        current_emotion: str,
-        tenant_id: str,
-        user_id: str,
-        max_results: int,
-        buffer_units: Optional[List[Dict[str, Any]]] = None,
-    ) -> List[Dict[str, Any]]:
-        """
-        补偿检索策略：当正常检索失败时，尝试更宽松的检索条件。
-
-        策略（按顺序尝试）：
-        1. 降低score阈值（从0.25降到0.15）
-        2. 扩大图遍历深度（从2跳到3跳）
-        3. 放宽关键词匹配（使用更短的子串）
-
-        Args:
-            query: 查询字符串
-            entities: 提取的实体列表
-            keywords: 提取的关键词列表
-            current_emotion: 当前情绪
-            tenant_id: 租户ID
-            user_id: 用户ID
-            max_results: 最大结果数
-
-        Returns:
-            补偿检索的候选列表（confidence标记为0.5）
-        """
-        logger.info("Attempting fallback retrieval for query: %s", query)
-
-        # Strategy 1: Lower score threshold
-        node_candidates: Dict[str, Any] = {}
-
-        # Re-run graph searches (same as before)
-        graph_tasks = []
-        for entity in entities:
-            graph_tasks.append(self._search_by_name(entity, tenant_id, user_id))
-            graph_tasks.append(self._search_by_alias(entity, tenant_id, user_id))
-        for kw in keywords:
-            graph_tasks.append(self._search_fuzzy(kw, tenant_id, user_id))
-
-        if graph_tasks:
-            results = await asyncio.gather(*graph_tasks, return_exceptions=True)
-            for result in results:
-                if isinstance(result, Exception):
-                    continue
-                for node in result:
-                    if node.id not in node_candidates:
-                        node_candidates[node.id] = node
-
-        # Strategy 2: Expand traversal depth to 3 hops
-        if node_candidates:
-            traversal_tasks = [
-                self._traverse_deep(node_id) for node_id in list(node_candidates.keys())[:5]
-            ]
-            traversal_results = await asyncio.gather(*traversal_tasks, return_exceptions=True)
-            for tresult in traversal_results:
-                if isinstance(tresult, Exception):
-                    continue
-                for row in tresult:
-                    node_id = row.get("to_id")
-                    if node_id and node_id not in node_candidates:
-                        node_candidates[node_id] = self._node_from_traversal(row)
-
-        # Strategy 3: Relaxed keyword matching (shorter substrings)
-        if not node_candidates:
-            # Try matching with shorter substrings (2+ chars instead of full keywords)
-            all_terms = entities + keywords
-            short_terms = []
-            for term in all_terms:
-                if len(term) >= 4:
-                    # Extract 2-3 char substrings
-                    short_terms.append(term[:3])
-                    short_terms.append(term[-3:])
-                elif len(term) >= 2:
-                    short_terms.append(term)
-
-            for term in short_terms[:10]:  # Limit to avoid too many queries
-                try:
-                    fuzzy_results = await self.graph.find_nodes_fuzzy(term, tenant_id, user_id)
-                    for node in fuzzy_results:
-                        if node.id not in node_candidates:
-                            node_candidates[node.id] = node
-                except Exception as e:
-                    logger.warning("Fallback fuzzy search failed for '%s': %s", term, e)
-
-        if not node_candidates:
-            logger.info("Fallback retrieval found no candidates")
-            return []
-
-        # Score candidates with LOWER threshold (0.15 instead of 0.25)
-        # buffer_units already read by the caller (retrieve()); reuse to avoid duplicate DB read
-        if buffer_units is None:
-            buffer_units = []
-
-        scored = self._score_candidates(
-            list(node_candidates.values()), buffer_units, query, entities, keywords, current_emotion
-        )
-
-        # Apply lower threshold
-        FALLBACK_THRESHOLD = 0.15
-        scored = [c for c in scored if c["score"] >= FALLBACK_THRESHOLD]
-
-        if not scored:
-            logger.info("Fallback retrieval: no candidates passed lower threshold")
-            return []
-
-        # Mark all fallback results with lower confidence
-        for candidate in scored[:max_results]:
-            candidate["confidence"] = 0.5  # Lower confidence for fallback results
-
-        logger.info("Fallback retrieval found %d candidates (confidence=0.5)", len(scored[:max_results]))
-        return scored[:max_results]
-
-    async def _traverse_deep(self, node_id: str) -> list:
-        """Traverse relations with depth=3 for fallback retrieval."""
-        try:
-            return await self.graph.traverse_relations(node_id, max_depth=3)
-        except Exception as e:
-            logger.warning("Deep traversal failed for '%s': %s", node_id, e)
-            return []

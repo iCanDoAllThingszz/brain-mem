@@ -583,6 +583,10 @@ class Encoder:
                     linked_node_ids.append(nodes[0].id)
                     linked_node_names.append(nodes[0].name)
 
+        # 根据消息内容推断重复次数
+        # 0 = 无限重复，1 = 一次性，>1 = 指定次数
+        repeat_num = self._infer_repeat_num(message, action)
+
         # Create a memory node for the prospective memory
         node_id = str(uuid.uuid4())
         node = Node(
@@ -598,6 +602,7 @@ class Encoder:
                 "trigger_value": trigger_value,
                 "action": action,
                 "status": "pending",
+                "repeat_num": repeat_num,  # 重复次数
                 "created_from": message,
                 "session_id": session_id,
                 "linked_entities": linked_node_names,
@@ -654,6 +659,47 @@ class Encoder:
             "session_id": session_id,
             "timestamp": datetime.utcnow().isoformat(),
         }
+
+    def _infer_repeat_num(self, message: str, action: str) -> int:
+        """
+        根据消息内容推断重复次数。
+
+        规则：
+        - 包含"每次"、"总是"、"一直" → 0（无限重复）
+        - 包含"一次"、"这次"、"明天" → 1（一次性）
+        - 包含数字（如"3次"、"两次"） → 提取数字
+        - 默认 → 1（一次性）
+
+        Args:
+            message: 原始消息
+            action: 提醒动作
+
+        Returns:
+            重复次数（0=无限，1=一次，>1=指定次数）
+        """
+        text = (message + " " + action).lower()
+
+        # 无限重复关键词
+        if any(kw in text for kw in ["每次", "总是", "一直", "永远", "持续"]):
+            return 0
+
+        # 一次性关键词
+        if any(kw in text for kw in ["一次", "这次", "明天", "今天", "下次"]):
+            return 1
+
+        # 提取数字
+        import re
+        num_match = re.search(r'(\d+|[一二三四五])次', text)
+        if num_match:
+            num_str = num_match.group(1)
+            cn_num = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5}
+            if num_str in cn_num:
+                return cn_num[num_str]
+            elif num_str.isdigit():
+                return int(num_str)
+
+        # 默认一次性
+        return 1
 
     async def _encode_forget(
         self,

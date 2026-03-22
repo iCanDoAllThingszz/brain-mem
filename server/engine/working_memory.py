@@ -70,48 +70,48 @@ class WorkingMemory:
         agent_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
-        Cold-boot load of working memory for a new session.
+        为新会话冷启动加载工作记忆。
 
-        Pulls from long-term memory:
-        1. User core profile (uses passed-in user_profile if provided).
-        2. Active goals (graph nodes tagged "计划" or "目标" with status=active).
-        3. Recent key events (last 7 days episodic nodes, top 5 by importance).
-        4. Emotional baseline (statistics from recent nodes' emotional_tag).
-        5. Last session summary (from buffer).
-        6. Pending reminders (nodes tagged "计划"/"提醒" with status=pending).
+        从长期记忆中提取：
+        1. 用户核心档案（如果提供则使用传入的user_profile）
+        2. 活跃目标（标记为"计划"或"目标"且status=active的图谱节点）
+        3. 近期关键事件（最近7天的情景节点，按重要性取前5个）
+        4. 情绪基线（从近期节点的emotional_tag统计）
+        5. 上次会话摘要（从缓冲区获取）
+        6. 待处理提醒（标记为"计划"/"提醒"且status=pending的节点）
 
-        Then uses LLM to synthesize into a natural-language context string.
+        然后使用LLM合成为自然语言上下文字符串。
 
         Args:
-            tenant_id: Tenant identifier.
-            user_id: User identifier.
-            session_id: New session identifier.
-            user_profile: Optional pre-loaded user profile dict.
-            agent_context: Optional additional agent context dict.
+            tenant_id: 租户标识符
+            user_id: 用户标识符
+            session_id: 新会话标识符
+            user_profile: 可选的预加载用户档案字典
+            agent_context: 可选的额外代理上下文字典
 
         Returns:
-            Working memory dict with keys:
-                - "context": str — natural language background context
+            工作记忆字典，包含以下键：
+                - "context": str — 自然语言背景上下文
                 - "pending_reminders": list[str]
                 - "user_goals": list[str]
                 - "emotional_baseline": "positive" | "negative" | "neutral"
-                - "raw": dict — raw data for other engine components
+                - "raw": dict — 供其他引擎组件使用的原始数据
         """
         raw: Dict[str, Any] = {}
 
-        # 1. User profile — prefer persistent store (incrementally enriched by LLM),
-        #    fall back to the value passed in from the caller
+        # 1. 用户档案 — 优先使用持久化存储（由LLM逐步丰富），
+        #    回退到调用方传入的值
         if self.profile_store:
             stored = self.profile_store.get(tenant_id, user_id)
             raw["user_profile"] = stored["profile"] or user_profile or {}
-            stored_goals = stored["goals"]  # May be used below
+            stored_goals = stored["goals"]  # 下面可能会用到
         else:
             raw["user_profile"] = user_profile or {}
             stored_goals = []
 
-        # 2. Active goals — use stored goals (LLM-enriched, contain status+progress)
-        #    when available; fall back to graph query otherwise
-        # Fetch all active nodes once and reuse for goals, reminders, and reviews (P8)
+        # 2. 活跃目标 — 使用存储的目标（LLM丰富的，包含status+progress）
+        #    如果可用；否则回退到图谱查询
+        # 一次性获取所有活跃节点，供目标、提醒和复习使用（性能优化）
         all_active_nodes = []
         try:
             all_active_nodes = await self.graph.find_active_nodes(tenant_id, user_id)
@@ -124,15 +124,15 @@ class WorkingMemory:
             active_goals = self._filter_goals(all_active_nodes)
         raw["active_goals"] = active_goals
 
-        # 3. Recent key events (last 7 days episodic nodes)
+        # 3. 近期关键事件（最近7天的情景节点）
         recent_events = await self._fetch_recent_events(tenant_id, user_id, days=7, top_n=5)
         raw["recent_events"] = recent_events
 
-        # 4. Emotional baseline
+        # 4. 情绪基线
         emotional_baseline = self._compute_emotional_baseline(recent_events)
         raw["emotional_baseline"] = emotional_baseline
 
-        # 5. Last session summary
+        # 5. 上次会话摘要
         last_summary = None
         try:
             last_summary = self.buffer.get_latest_session_summary(tenant_id, user_id)
@@ -140,25 +140,25 @@ class WorkingMemory:
             logger.warning("get_latest_session_summary failed: %s", e)
         raw["last_session_summary"] = last_summary
 
-        # 6. Pending reminders (reuse all_active_nodes)
+        # 6. 待处理提醒（复用all_active_nodes）
         pending_reminders = self._filter_pending_reminders(all_active_nodes)
         raw["pending_reminders"] = pending_reminders
 
-        # 7. Pending reviews (reuse all_active_nodes)
+        # 7. 待复习记忆（复用all_active_nodes）
         pending_reviews = self._filter_pending_reviews(all_active_nodes)
         raw["pending_reviews"] = pending_reviews
 
         if agent_context:
             raw["agent_context"] = agent_context
 
-        # Synthesize natural language context via LLM
+        # 通过LLM合成自然语言上下文
         context_text = await self._synthesize_context(raw)
 
         wm = {
             "context": context_text,
             "pending_reminders": [r.get("name", str(r)) for r in pending_reminders],
             "pending_reviews": [r.get("name", str(r)) for r in pending_reviews],
-            # For stored goals include progress so perceiver gets richer context
+            # 对于存储的目标，包含进度信息，让感知器获得更丰富的上下文
             "user_goals": [_goal_label(g) for g in active_goals],
             "emotional_baseline": emotional_baseline,
             "raw": raw,

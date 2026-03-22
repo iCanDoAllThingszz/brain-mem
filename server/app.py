@@ -195,7 +195,7 @@ async def session_start(req: SessionStartRequest, request: Request):
         wm = request.app.state.working_memory
         prospective_checker = request.app.state.prospective_checker
 
-        # Check for time-based prospective memory triggers
+        # 检查基于时间的前瞻性记忆触发器
         triggered_reminders = await prospective_checker.check_time_triggers(
             req.tenant_id, req.user_id
         )
@@ -205,7 +205,7 @@ async def session_start(req: SessionStartRequest, request: Request):
             req.user_profile, req.agent_context,
         )
 
-        # Add triggered reminders to pending_reminders
+        # 将触发的提醒添加到待处理提醒列表
         pending_reminders = result.get("pending_reminders", [])
         for reminder in triggered_reminders:
             pending_reminders.append(reminder['action'])

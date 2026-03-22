@@ -218,7 +218,10 @@ const brainMemoryPlugin = {
 
             const context = result?.data?.context || "No relevant memories found.";
             return {
-              content: [{ type: "text", text: context }],
+              content: [{
+                type: "text",
+                text: `用户问题: ${query}\n\n相关记忆:\n${context}`
+              }],
             };
           } catch (err) {
             return {

@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import random
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from server.activity_log import log_event
@@ -91,19 +91,16 @@ _CREATIVE_RECOMBINATION_SYSTEM = """\
 # 隐含关系推导提示词（v3新增）
 # ---------------------------------------------------------------------------
 _INFER_RELATIONS_SYSTEM = """\
-你是知识图谱关系推导引擎。给定一组人物节点及其已有关系，推导缺失的隐含关系。
+你是知识图谱关系推导引擎。给定一组节点及其已有关系，推导缺失的隐含关系。
 
-规则：
-- 如果A和B都是C的同事，那么A和B很可能也是同事
-- 如果A是C的上级/leader，B也是C的同事，那么A很可能也是B的上级
-- 如果A向B汇报（虚线/实线），C也向B汇报，那么A和C很可能是平级同事
-- 如果A和B在同一个组织/团队工作，他们很可能是同事
+推导规则：
+- 传递性关系：如果A和B都与C有相同类型的关系，推导A和B之间可能的关系
+- 层级关系：如果A是C的上级，B是C的下级，推导A和B的层级关系
+- 组织关系：如果A和B属于同一组织/团队/项目，推导他们之间的协作关系
+- 因果关系：如果A导致B，B导致C，推导A和C的间接因果关系
 - 只推导高置信度（>90%）的关系
 - 不要推导已经明确存在的关系
-- 不要跨不同组织推导关系，除非有强证据
-
-输入：一组人物节点及其已有关系
-输出：需要新增的关系列表
+- 不要跨不相关领域推导关系
 
 返回格式（仅JSON）：
 {
@@ -130,26 +127,42 @@ class Consolidator:
         self.buffer = buffer
 
     async def consolidate(self, tenant_id: str, user_id: str) -> Dict[str, Any]:
-        """Execute sleep consolidation: buffer -> long-term graph."""
+        """
+        执行睡眠巩固：将 Buffer 中的记忆单元转移到长期图谱。
+
+        流程：
+        1. 读取未归档的记忆单元
+        2. 过滤低重要性单元（importance < 3.0）
+        3. 逐单元处理：创建/更新节点和关系
+        4. 归档已处理的单元
+        5. 模式发现和冲突解决
+        6. 孤儿节点修复
+        7. 创意重组
+        8. 图谱清理
+
+        Args:
+            tenant_id: 租户ID
+            user_id: 用户ID
+
+        Returns:
+            统计信息字典
+        """
         stats: Dict[str, Any] = {
             "nodes_created": 0, "nodes_updated": 0, "nodes_merged": 0,
             "relations_created": 0, "patterns_discovered": [], "conflicts_found": [],
             "units_processed": 0, "units_skipped": 0,
         }
 
+        # 步骤1: 读取未归档的记忆单元
         units = self.buffer.read_unarchived(tenant_id, user_id)
         if not units:
             logger.info("No unarchived units for tenant=%s user=%s", tenant_id, user_id)
-            # Still run orphan repair even with no new units
-            try:
-                orphan_rels = await self._repair_orphans(tenant_id, user_id, {})
-                stats["relations_created"] += orphan_rels
-            except Exception as e:
-                logger.warning("Orphan repair failed: %s", e)
             return stats
 
+        # 步骤2: 过滤低重要性单元（importance < 3.0）
         valid_units = [u for u in units if float(u.get("importance", 0)) >= 3.0]
-        stats["units_skipped"] = len(units) - len(valid_units)
+        low_imp_units = [u for u in units if float(u.get("importance", 0)) < 3.0]
+        stats["units_skipped"] = len(low_imp_units)
 
         log_event("consolidation_start",
             f"Processing {len(valid_units)} units (skipped {stats['units_skipped']} low-imp)",
@@ -157,6 +170,7 @@ class Consolidator:
 
         name_to_id: Dict[str, str] = {}
 
+        # 步骤3: 处理有效单元（创建/更新节点和关系）
         for unit in valid_units:
             unit_id = unit.get("id", "")
             try:
@@ -192,39 +206,39 @@ class Consolidator:
             except Exception as e:
                 logger.error("Failed to consolidate unit %s: %s", unit_id, e)
 
-        # Archive low-importance units too
-        for unit in units:
-            if float(unit.get("importance", 0)) < 3.0:
-                uid = unit.get("id", "")
-                if uid:
-                    self.buffer.archive_by_id(uid)
+        # 步骤4: 归档低重要性单元（不处理，直接归档）
+        for unit in low_imp_units:
+            uid = unit.get("id", "")
+            if uid:
+                self.buffer.archive_by_id(uid)
 
-        patterns, conflicts = await self._discover_patterns(valid_units)
+        # 步骤5: 模式发现和冲突检测
+        patterns, conflicts = await self._discover_patterns(valid_units, tenant_id, user_id)
         stats["patterns_discovered"] = patterns
         stats["conflicts_found"] = conflicts
 
-        # Step 5.4: Resolve conflicts from interference detection
+        # 步骤6: 解决干扰检测发现的冲突
         try:
             conflicts_resolved = await self._resolve_conflicts(tenant_id, user_id)
             stats["conflicts_resolved"] = conflicts_resolved
         except Exception as e:
             logger.warning("Conflict resolution failed: %s", e)
 
-        # Step 5.5: Repair orphan nodes (suggest missing relations)
+        # 步骤7: 修复孤儿节点（建议缺失的关系）
         try:
             orphan_rels = await self._repair_orphans(tenant_id, user_id, name_to_id)
             stats["relations_created"] += orphan_rels
         except Exception as e:
             logger.warning("Orphan repair failed: %s", e)
 
-        # Step 5.6: Creative recombination (after pattern discovery)
+        # 步骤8: 创意重组（模式发现后的洞察生成）
         try:
             insights_created = await self._creative_recombination(tenant_id, user_id)
             stats["insights_created"] = insights_created
         except Exception as e:
             logger.warning("Creative recombination failed: %s", e)
 
-        # Step 5.7: Graph hygiene / cleaning (after all writes complete)
+        # 步骤9: 图谱清理（所有写入完成后）
         try:
             review_stats = await self._llm_graph_review(tenant_id, user_id)
             stats["llm_review_merged"] = review_stats.get("merged", 0)
@@ -233,7 +247,7 @@ class Consolidator:
         except Exception as e:
             logger.warning("LLM graph review failed: %s", e)
 
-        # Step 5.8: 隐含关系推导（在图谱清洁之后，确保重复节点已合并）
+        # 步骤10: 隐含关系推导（在图谱清理后，确保重复节点已合并）
         try:
             inferred_rels = await self._infer_implicit_relations(tenant_id, user_id)
             stats["inferred_relations"] = inferred_rels
@@ -241,18 +255,13 @@ class Consolidator:
         except Exception as e:
             logger.warning("Implicit relation inference failed: %s", e)
 
-        try:
-            orphans_handled = await self._handle_orphan_nodes(tenant_id, user_id)
-            stats["orphans_handled"] = orphans_handled
-        except Exception as e:
-            logger.warning("Orphan node handling failed: %s", e)
-
+        # 步骤11: 应用遗忘衰减（降低长期未访问节点的检索强度）
         try:
             await self.graph.apply_decay(tenant_id, user_id)
         except Exception as e:
             logger.error("apply_decay failed: %s", e)
 
-        # Step 6: Check spaced repetition (mark important memories for review)
+        # 步骤12: 间隔重复检查（标记重要记忆以供复习）
         try:
             review_count = await self._check_spaced_repetition(tenant_id, user_id)
             stats["memories_marked_for_review"] = review_count
@@ -274,10 +283,20 @@ class Consolidator:
         self, entity: Dict[str, Any], tenant_id: str, user_id: str, unit: Dict[str, Any],
     ) -> Tuple[Optional[str], bool, bool]:
         """
-        根据encoder v2的action字段插入或更新实体。
-        创建/更新后自动生成embedding。
-        
-        Returns: (node_id, created, merged)
+        根据 encoder v2 的 action 字段插入或更新实体。
+        创建/更新后自动生成 embedding。
+
+        Args:
+            entity: 实体数据（包含 action, name, existing_id 等）
+            tenant_id: 租户ID
+            user_id: 用户ID
+            unit: 原始记忆单元（用于日志）
+
+        Returns:
+            (node_id, created, merged) 元组
+            - node_id: 节点ID
+            - created: 是否新建
+            - merged: 是否合并
         """
         name = entity.get("name", "").strip()
         if not name:
@@ -288,7 +307,7 @@ class Consolidator:
         aliases = entity.get("aliases_to_add", [])
         tags = entity.get("tags", [])
 
-        # --- merge / update ---
+        # 情况1: 合并或更新现有节点
         if action in ("merge", "update") and existing_id:
             try:
                 updates: Dict[str, Any] = {"updated_at": datetime.utcnow().isoformat()}
@@ -425,7 +444,19 @@ class Consolidator:
         self, rel_data: Dict[str, Any], name_to_id: Dict[str, str],
         tenant_id: str, user_id: str, unit: Dict[str, Any],
     ) -> bool:
-        """Create a relation if it doesn't already exist."""
+        """
+        创建关系（如果不存在）。
+
+        Args:
+            rel_data: 关系数据（from_name, to_name, type, description等）
+            name_to_id: 实体名到节点ID的映射
+            tenant_id: 租户ID（未使用，保留用于扩展）
+            user_id: 用户ID（未使用，保留用于扩展）
+            unit: 原始记忆单元
+
+        Returns:
+            是否成功创建关系
+        """
         from_name = rel_data.get("from_name", "")
         to_name = rel_data.get("to_name", "")
         rel_type = rel_data.get("type", "RELATED_TO").upper().replace(" ", "_")
@@ -461,9 +492,19 @@ class Consolidator:
     # ------------------------------------------------------------------
 
     async def _discover_patterns(
-        self, units: List[Dict[str, Any]]
+        self, units: List[Dict[str, Any]], tenant_id: str, user_id: str
     ) -> Tuple[List[str], List[str]]:
-        """Use LLM to discover cross-event patterns."""
+        """
+        使用LLM发现跨事件模式，并将模式持久化到图谱。
+
+        Args:
+            units: 记忆单元列表
+            tenant_id: 租户ID
+            user_id: 用户ID
+
+        Returns:
+            (patterns, conflicts) 元组
+        """
         if len(units) < 3:
             return [], []
         fragments = "\n".join(
@@ -472,7 +513,26 @@ class Consolidator:
         )
         try:
             result = await call_llm_json(_PATTERN_SYSTEM, f"Memory fragments:\n{fragments}")
-            return result.get("patterns", []), result.get("conflicts", [])
+            patterns = result.get("patterns", [])
+            conflicts = result.get("conflicts", [])
+
+            # 将发现的模式持久化到图谱
+            for pattern in patterns:
+                try:
+                    pattern_node = Node(
+                        name=f"模式: {pattern[:50]}",
+                        tags=["模式", "自动发现"],
+                        summary=pattern,
+                        zone="semantic",
+                        importance=5.0,
+                        confidence=0.6,
+                        properties={"pattern_type": "cross_event", "discovered_at": datetime.utcnow().isoformat()}
+                    )
+                    await self.graph.create_node(pattern_node, tenant_id, user_id)
+                except Exception as e:
+                    logger.warning("Failed to persist pattern: %s", e)
+
+            return patterns, conflicts
         except Exception as e:
             logger.warning("Pattern discovery failed: %s", e)
             return [], []
@@ -480,9 +540,20 @@ class Consolidator:
     async def _repair_orphans(
         self, tenant_id: str, user_id: str, name_to_id: Dict[str, str]
     ) -> int:
-        """Find orphan nodes and suggest missing relationships via LLM."""
+        """
+        查找孤儿节点并通过LLM建议缺失的关系。
+
+        Args:
+            tenant_id: 租户ID
+            user_id: 用户ID
+            name_to_id: 实体名称到ID的映射
+
+        Returns:
+            创建的关系数量
+        """
         all_nodes = await self.graph.find_active_nodes(tenant_id, user_id)
-        
+
+        # 分类节点：孤儿节点（无关系）vs 已连接节点
         orphans = []
         connected = []
         for node in all_nodes:
@@ -492,36 +563,38 @@ class Consolidator:
                 orphans.append(info)
             else:
                 connected.append(info)
-        
+
         if not orphans or not connected:
             return 0
-        
+
+        # 构建LLM输入
         orphan_text = "\n".join(f"- {o['name']} (tags={o['tags']}, summary={o['summary'][:60]})" for o in orphans)
         connected_text = "\n".join(f"- {c['name']} (tags={c['tags']}, summary={c['summary'][:60]})" for c in connected[:20])
-        
-        user_prompt = f"Orphan nodes (no relationships):\n{orphan_text}\n\nConnected nodes:\n{connected_text}"
-        
+
+        user_prompt = f"孤儿节点（无关系）:\n{orphan_text}\n\n已连接节点:\n{connected_text}"
+
         try:
             result = await call_llm_json(_ORPHAN_RELATION_SYSTEM, user_prompt, temperature=0.1)
         except Exception as e:
             logger.warning("Orphan relation suggestion failed: %s", e)
             return 0
-        
-        # Build name→id map for all nodes
+
+        # 构建name→id映射（包含所有节点）
         all_name_to_id = {n.name: n.id for n in all_nodes}
         all_name_to_id.update(name_to_id)
         
+        # 创建建议的关系
         created = 0
         for rel in result.get("suggested_relations", []):
             from_name = rel.get("from_name", "")
             to_name = rel.get("to_name", "")
             rel_type = rel.get("type", "RELATED_TO").upper().replace(" ", "_")
-            
+
             from_id = all_name_to_id.get(from_name)
             to_id = all_name_to_id.get(to_name)
             if not from_id or not to_id:
                 continue
-            
+
             try:
                 relation = Relation(
                     from_id=from_id, to_id=to_id, type=rel_type,
@@ -536,7 +609,7 @@ class Consolidator:
                 })
             except Exception as e:
                 logger.warning("Failed to create orphan relation %s->%s: %s", from_name, to_name, e)
-        
+
         if created:
             logger.info("Repaired %d orphan relationships", created)
         return created
@@ -593,11 +666,11 @@ class Consolidator:
             解决的冲突数量
         """
         try:
-            # Find all nodes with conflict markers
+            # 查找所有带冲突标记的节点
             all_nodes = await self.graph.find_active_nodes(tenant_id, user_id)
             conflict_nodes = [
                 n for n in all_nodes
-                if n.properties.get("_conflict_with")
+                if n.properties.get("_conflict_old_summary")
             ]
 
             if not conflict_nodes:
@@ -606,54 +679,53 @@ class Consolidator:
             resolved_count = 0
             for node in conflict_nodes:
                 try:
-                    conflict_with = node.properties.get("_conflict_with")
                     old_summary = node.properties.get("_conflict_old_summary", "")
                     new_summary = node.properties.get("_conflict_new_summary", "")
 
-                    # Use LLM to decide how to resolve
+                    # 使用LLM决定如何解决冲突
                     system_prompt = """\
-You are a conflict resolver for a memory system. Two pieces of information contradict each other.
+你是记忆系统的冲突解决专家。两条信息相互矛盾。
 
-Decide how to resolve:
-1. "keep_new" - New information is correct, discard old
-2. "keep_old" - Old information is correct, discard new
-3. "keep_both" - Both are valid at different times, keep timeline
-4. "merge" - Merge both into a coherent statement
+决定如何解决：
+1. "keep_new" - 新信息正确，丢弃旧信息
+2. "keep_old" - 旧信息正确，丢弃新信息
+3. "keep_both" - 两者在不同时间都有效，保留时间线
+4. "merge" - 将两者合并为连贯的陈述
 
-Return ONLY valid JSON:
+仅返回有效JSON：
 {
   "resolution": "keep_new" | "keep_old" | "keep_both" | "merge",
-  "reason": "brief explanation",
-  "merged_summary": "merged text if resolution=merge"
+  "reason": "简要说明",
+  "merged_summary": "如果resolution=merge则提供合并后的文本"
 }
 """
-                    user_prompt = f"""Entity: {node.name}
+                    user_prompt = f"""实体: {node.name}
 
-Old information: {old_summary}
+旧信息: {old_summary}
 
-New information: {new_summary}
+新信息: {new_summary}
 
-How should we resolve this conflict?"""
+应该如何解决这个冲突？"""
 
                     result = await call_llm_json(system_prompt, user_prompt, temperature=0.1)
                     resolution = result.get("resolution", "keep_both")
 
-                    # Apply resolution
+                    # 应用解决方案
                     updates = {}
                     if resolution == "keep_new":
-                        # Keep new summary, clear conflict markers
+                        # 保留新摘要，清除冲突标记
                         updates["summary"] = new_summary
                     elif resolution == "keep_old":
-                        # Revert to old summary
+                        # 恢复旧摘要
                         updates["summary"] = old_summary
                     elif resolution == "keep_both":
-                        # Add timeline annotation
+                        # 添加时间线注释
                         updates["summary"] = f"{old_summary} [后更新为: {new_summary}]"
                     elif resolution == "merge":
-                        # Use LLM-merged version
+                        # 使用LLM合并后的版本
                         updates["summary"] = result.get("merged_summary", new_summary)
 
-                    # Clear conflict markers
+                    # 清除冲突标记
                     new_props = {k: v for k, v in node.properties.items()
                                 if not k.startswith("_conflict_")}
                     updates["properties"] = new_props
@@ -682,7 +754,10 @@ How should we resolve this conflict?"""
 
     async def _check_spaced_repetition(self, tenant_id: str, user_id: str) -> int:
         """
-        扫描图谱中所有active节点，找出重要但快被遗忘的记忆，标记为需要复习。
+        扫描图谱中所有active节点，对重要记忆进行间隔重复强化。
+
+        直接提升retrieval_strength，模拟复习效果，与apply_decay的自然衰减对抗。
+        确保重要记忆不会因长期未访问而衰减到dormant。
 
         间隔重复算法：
         - 第1次复习：1天后
@@ -696,10 +771,10 @@ How should we resolve this conflict?"""
             user_id: 用户ID
 
         Returns:
-            标记为需要复习的节点数量
+            完成复习的节点数量
         """
         try:
-            # Find all active nodes with importance >= 6
+            # 查找所有重要性>=6的活跃节点
             all_nodes = await self.graph.find_active_nodes(tenant_id, user_id, min_strength=0.0)
             important_nodes = [n for n in all_nodes if n.importance >= 6.0]
 
@@ -707,35 +782,30 @@ How should we resolve this conflict?"""
                 return 0
 
             now = datetime.utcnow()
-            marked_count = 0
+            reviewed_count = 0
 
-            # Spaced repetition intervals (in days)
-            INTERVALS = [1, 3, 7, 21]  # First 4 reviews
+            # 间隔重复时间间隔（天数）
+            INTERVALS = [1, 3, 7, 21]  # 前4次复习
 
             for node in important_nodes:
                 props = node.properties or {}
 
-                # Skip if already marked for review
-                if props.get("needs_review"):
-                    continue
-
-                # Get review history
+                # 获取复习历史
                 review_count = props.get("review_count", 0)
                 last_review_date_str = props.get("last_review_date")
-                next_review_date_str = props.get("next_review_date")
 
-                # Calculate next review date based on review count
+                # 根据复习次数计算下次复习间隔
                 if review_count < len(INTERVALS):
                     interval_days = INTERVALS[review_count]
                 else:
-                    # After 4th review, double the interval each time
+                    # 第4次复习后，每次间隔翻倍
                     interval_days = INTERVALS[-1] * (2 ** (review_count - len(INTERVALS) + 1))
 
-                # Determine if review is needed
+                # 判断是否需要复习
                 needs_review = False
 
                 if not last_review_date_str:
-                    # Never reviewed, use last_accessed as baseline
+                    # 从未复习过，使用last_accessed作为基准
                     last_accessed = node.last_accessed
                     if isinstance(last_accessed, datetime):
                         last_accessed_dt = last_accessed
@@ -749,42 +819,54 @@ How should we resolve this conflict?"""
                         last_accessed_dt = now
 
                     days_since_access = (now - last_accessed_dt).days
-                    # If retrieval_strength is dropping and it's been a while, mark for review
+                    # 如果检索强度下降且已过一段时间，进行复习
                     if node.retrieval_strength < 3.0 and days_since_access >= interval_days:
                         needs_review = True
-                        next_review_date = now
                 else:
-                    # Has review history, check if next review date has passed
-                    if next_review_date_str:
-                        try:
-                            next_review_dt = datetime.fromisoformat(next_review_date_str.replace("Z", "+00:00"))
-                            next_review_dt = next_review_dt.replace(tzinfo=None)
-                            if now >= next_review_dt:
-                                needs_review = True
-                                next_review_date = now
-                        except Exception:
-                            pass
+                    # 有复习历史，检查是否到了下次复习时间
+                    try:
+                        last_review_dt = datetime.fromisoformat(last_review_date_str.replace("Z", "+00:00"))
+                        last_review_dt = last_review_dt.replace(tzinfo=None)
+                        days_since_review = (now - last_review_dt).days
+                        if days_since_review >= interval_days:
+                            needs_review = True
+                    except Exception:
+                        pass
 
                 if needs_review:
-                    # Mark node for review
-                    updates = {
-                        "properties": {
-                            **props,
-                            "needs_review": True,
-                            "next_review_date": next_review_date.isoformat(),
-                        }
+                    # 直接强化记忆：提升retrieval_strength
+                    new_strength = min(10.0, node.retrieval_strength + 2.0)
+                    new_review_count = review_count + 1
+
+                    # 计算下次复习时间
+                    if new_review_count < len(INTERVALS):
+                        next_interval = INTERVALS[new_review_count]
+                    else:
+                        next_interval = INTERVALS[-1] * (2 ** (new_review_count - len(INTERVALS) + 1))
+
+                    next_review_date = now + timedelta(days=next_interval)
+
+                    updated_props = {
+                        **props,
+                        "review_count": new_review_count,
+                        "last_review_date": now.isoformat(),
+                        "next_review_date": next_review_date.isoformat(),
                     }
-                    await self.graph.update_node(node.id, updates)
-                    marked_count += 1
+
+                    await self.graph.update_node(node.id, {
+                        "retrieval_strength": new_strength,
+                        "properties": updated_props
+                    })
+                    reviewed_count += 1
                     logger.info(
-                        "Marked node %s (entity=%s, importance=%.1f, strength=%.1f) for spaced repetition review",
-                        node.id[:8], node.name, node.importance, node.retrieval_strength
+                        "Spaced repetition: reviewed node %s (entity=%s, strength %.1f→%.1f, review_count=%d, next in %d days)",
+                        node.id[:8], node.name, node.retrieval_strength, new_strength, new_review_count, next_interval
                     )
 
-            if marked_count > 0:
-                logger.info("Spaced repetition: marked %d memories for review", marked_count)
+            if reviewed_count > 0:
+                logger.info("Spaced repetition: reviewed %d important memories", reviewed_count)
 
-            return marked_count
+            return reviewed_count
 
         except Exception as e:
             logger.error("Spaced repetition check failed: %s", e)
@@ -930,40 +1012,40 @@ How should we resolve this conflict?"""
     async def _infer_implicit_relations(self, tenant_id: str, user_id: str) -> int:
         """
         推导图谱中缺失的隐含关系。
-        
-        扫描人物节点及其已有关系，利用LLM推导缺失的隐含关系。
-        例如：如果A和B都是C的同事，推导A和B也是同事。
-        
+
+        扫描高重要性节点及其已有关系，利用LLM推导缺失的隐含关系。
+        例如：如果A和B都与C有关系，推导A和B之间可能的关系。
+
         Returns:
             新增的关系数量
         """
         relations_created = 0
-        
+
         try:
-            # 获取所有带"人物"或"同事"标签的活跃节点
+            # 获取所有活跃节点
             all_nodes = await self.graph.find_active_nodes(tenant_id, user_id)
             if not all_nodes:
                 return 0
+
+            # 筛选高重要性节点（importance >= 5.0）且有至少1个关系的节点
+            candidate_nodes = []
+            for n in all_nodes:
+                if n.importance >= 5.0:
+                    rels = await self.graph.get_relations(n.id)
+                    if rels:
+                        candidate_nodes.append(n)
             
-            # 筛选人物相关节点（标签包含人物、同事、求职者、leader等）
-            person_tags = {"人物", "同事", "求职者", "leader", "上级", "家人", "朋友", "同学",
-                          "联系人", "裁员风险", "2023届校招生", "2024届校招生"}
-            person_nodes = [
-                n for n in all_nodes
-                if any(t in person_tags for t in (n.tags or []))
-            ]
-            
-            if len(person_nodes) < 2:
-                logger.info("Not enough person nodes for relation inference (%d)", len(person_nodes))
+            if len(candidate_nodes) < 2:
+                logger.info("Not enough candidate nodes for relation inference (%d)", len(candidate_nodes))
                 return 0
-            
-            logger.info("Inferring implicit relations among %d person nodes", len(person_nodes))
-            
-            # 获取这些人物节点之间的已有关系
+
+            logger.info("Inferring implicit relations among %d candidate nodes", len(candidate_nodes))
+
+            # 获取这些节点之间的已有关系
             existing_relations = []
-            for node in person_nodes:
+            for node in candidate_nodes:
                 try:
-                    rels = await self.graph.get_relations(node.id, tenant_id, user_id)
+                    rels = await self.graph.get_relations(node.id)
                     for rel in rels:
                         existing_relations.append({
                             "from": rel.get("from_name", ""),
@@ -972,10 +1054,10 @@ How should we resolve this conflict?"""
                         })
                 except Exception:
                     continue
-            
+
             # 构建LLM输入
             nodes_info = []
-            for n in person_nodes:
+            for n in candidate_nodes:
                 nodes_info.append({
                     "name": n.name,
                     "tags": n.tags,
@@ -993,27 +1075,27 @@ How should we resolve this conflict?"""
                     unique_rels.append(r)
             
             user_prompt = f"""\
-人物节点列表：
+节点列表：
 {json.dumps(nodes_info, ensure_ascii=False, indent=2)}
 
 已有关系：
 {json.dumps(unique_rels, ensure_ascii=False, indent=2)}
 
-请推导上述人物之间缺失的隐含关系。只推导高置信度（>90%）的关系。
+请推导上述节点之间缺失的隐含关系。只推导高置信度（>90%）的关系。
 """
-            
+
             result = await call_llm_json(
                 _INFER_RELATIONS_SYSTEM, user_prompt, temperature=0.1
             )
-            
+
             inferred = result.get("inferred_relations", [])
             if not inferred:
                 logger.info("No implicit relations inferred")
                 return 0
-            
+
             # 构建name→id映射
             name_to_id = {}
-            for n in person_nodes:
+            for n in candidate_nodes:
                 name_to_id[n.name] = n.id
                 for alias in (n.aliases or []):
                     name_to_id[alias] = n.id
@@ -1089,7 +1171,7 @@ How should we resolve this conflict?"""
         stats = {"merged": 0, "demoted": 0, "dormant": 0}
 
         try:
-            # Fetch all active nodes
+            # 获取所有活跃节点
             all_nodes = await self.graph.find_active_nodes(tenant_id, user_id)
             if not all_nodes:
                 logger.info("No active nodes to review")
@@ -1097,16 +1179,16 @@ How should we resolve this conflict?"""
 
             logger.info("LLM graph review: reviewing %d nodes", len(all_nodes))
 
-            # Process in batches (max 30 nodes per batch, max 3 batches = 90 nodes)
+            # 分批处理（每批最多30个节点，最多10批=300个节点）
             batch_size = 30
-            max_batches = 3
+            max_batches = 10
             batches = [all_nodes[i:i + batch_size] for i in range(0, len(all_nodes), batch_size)]
             batches = batches[:max_batches]
 
             for batch_idx, batch in enumerate(batches):
                 logger.info("Processing batch %d/%d (%d nodes)", batch_idx + 1, len(batches), len(batch))
 
-                # Build node summary for LLM
+                # 构建节点摘要供LLM审查
                 nodes_json = []
                 for node in batch:
                     nodes_json.append({
@@ -1149,11 +1231,11 @@ How should we resolve this conflict?"""
 """
 
                 user_prompt = f"""\
-Node list:
+节点列表:
 {json.dumps(nodes_json, ensure_ascii=False, indent=2)}
 """
 
-                # Call LLM
+                # 调用LLM
                 try:
                     result = await call_llm_json(system_prompt, user_prompt, temperature=0.2)
                     actions = result if isinstance(result, list) else result.get("actions", [])
@@ -1161,7 +1243,7 @@ Node list:
                     logger.error("LLM graph review batch %d failed: %s. Skipping batch.", batch_idx + 1, e)
                     continue
 
-                # Execute actions
+                # 执行操作
                 action_map = {a.get("name", ""): a for a in actions}
                 for node in batch:
                     action_data = action_map.get(node.name)
@@ -1180,7 +1262,7 @@ Node list:
                             logger.warning("Merge action for '%s' missing target, skipping", node.name)
                             continue
 
-                        # Find target node
+                        # 查找目标节点
                         target_nodes = await self.graph.find_nodes_by_name(merge_into, tenant_id, user_id)
                         if not target_nodes:
                             logger.warning("Merge target '%s' not found for '%s', skipping", merge_into, node.name)
@@ -1203,7 +1285,7 @@ Node list:
 
                     elif action == "demote":
                         try:
-                            # Reduce importance by 0.3
+                            # 降低重要性0.3
                             new_importance = max(0.0, node.importance - 0.3)
                             await self.graph.update_node(node.id, {"importance": new_importance})
                             stats["demoted"] += 1
