@@ -2,20 +2,13 @@ server:
   host: "0.0.0.0"
   port: 8100
 
-storage:
-  neo4j:
-    # For local development: bolt://localhost:7687
-    # For docker-compose: bolt://neo4j:7687 (use service name)
-    uri: "bolt://localhost:7687"
-    user: "neo4j"
-    password: "your-password"
-  buffer:
-    path: "./data/buffer.db"
-  tag_dict:
-    path: "./data/tag_dict.json"
+neo4j:
+  uri: "bolt://localhost:7687"
+  user: "neo4j"
+  password: "your-password"
 
 llm:
-  base_url: "https://api.example.com/v1"
-  model: "your-model-name"
+  provider: "minimax"
   api_key: "sk-your-api-key"
-  temperature: 0.3
+  base_url: "https://api.minimaxi.com/v1"
+  model: "MiniMax-Text-01"
