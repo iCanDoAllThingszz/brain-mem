@@ -419,7 +419,7 @@ async def _process_after_response(
                     # session can reference what was already discussed and encoded
                     if wm is not None:
                         session_msgs = list(wm.get("session_messages", []))
-                        session_msgs.append(memory_input)
+                        session_msgs.append("[userMsg]: " + user_message + "\n\n" + "[assistantResponse]: " + assistant_response)
                         wm_store.update(session_id, {"session_messages": session_msgs[-10:]})
 
                     # Incrementally update persistent user profile and goals,
