@@ -11,3 +11,9 @@ scripts/cleanup.py
 config.yaml
 !config.yaml.example
 *.backup
+
+# IntelliJ IDEA
+.idea/
+*.iml
+*.iws
+*.ipr

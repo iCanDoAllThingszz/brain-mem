@@ -199,6 +199,8 @@ class Retriever:
                             fuzzy_matches[node.id] = search_term
 
         # 路径E: 向量语义搜索（针对实体+query，与图搜索并行）
+        vector_candidates = {}  # 向量召回的节点
+        similarity_scores = {}  # 保存相似度得分
         try:
             from server.engine.embedding_client import get_embedding
             import numpy as np
@@ -216,21 +218,40 @@ class Retriever:
                 for vresult in vector_results:
                     if isinstance(vresult, Exception):
                         continue
-                    for node in vresult:
-                        if node.id not in node_candidates:
-                            node_candidates[node.id] = node
+                    for node, score in vresult:
+                        if node.id not in vector_candidates:
+                            vector_candidates[node.id] = node
+                            similarity_scores[node.id] = score
+                        else:
+                            # 保留最高相似度得分
+                            similarity_scores[node.id] = max(similarity_scores.get(node.id, 0), score)
         except ImportError:
             logger.debug("Embedding client not available, skipping vector search")
 
         # 步骤4: 关系遍历（从匹配节点出发，优先遍历重要节点）
-        # 按重要性排序，优先遍历高价值节点
-        sorted_candidates = sorted(
+        # 图搜索召回：全部保留，按importance排序
+        graph_sorted = sorted(
             node_candidates.items(),
             key=lambda x: getattr(x[1], 'importance', 5.0),
             reverse=True
         )
+
+        # 向量召回：按相似度优先，importance次之
+        vector_sorted = sorted(
+            vector_candidates.items(),
+            key=lambda x: (similarity_scores.get(x[0], 0.0), getattr(x[1], 'importance', 5.0)),
+            reverse=True
+        )
+
+        # 合并：图搜索全部 + 向量top5（去重）
+        sorted_candidates = graph_sorted[:]
+        seen_ids = {nid for nid, _ in graph_sorted}
+        for nid, node in vector_sorted[:5]:
+            if nid not in seen_ids:
+                sorted_candidates.append((nid, node))
+                seen_ids.add(nid)
         traversal_tasks = [
-            self._traverse(node_id) for node_id, _ in sorted_candidates[:5]
+            self._traverse(node_id) for node_id, _ in sorted_candidates[:]
         ]
 
         # 收集关系信息用于上下文重构
@@ -454,7 +475,7 @@ class Retriever:
             user_id: 用户ID
 
         Returns:
-            匹配的节点列表
+            匹配的(节点, 相似度得分)元组列表
         """
         try:
             from server.engine.embedding_client import get_embedding
@@ -464,14 +485,15 @@ class Retriever:
             # 检查是否为零向量（使用范数判断）
             if np.linalg.norm(embedding) > 0:
                 vector_hits = await self.graph.vector_search(embedding, top_k=5, min_score=0.5)
-                nodes = []
+                results = []
                 for hit in vector_hits:
                     node_data = hit["node"]
                     if node_data.get("id"):
-                        nodes.append(self._node_from_dict(node_data))
+                        node = self._node_from_dict(node_data)
+                        results.append((node, hit["score"]))
                         logger.debug("Vector search '%s' found: %s (score=%.2f)",
                                    text[:20], node_data.get("name"), hit["score"])
-                return nodes
+                return results
             return []
         except Exception as e:
             logger.warning("Vector search for '%s' failed: %s", text, e)
